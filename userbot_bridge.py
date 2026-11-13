@@ -2,6 +2,7 @@ import os
 import re
 import asyncio
 import sqlite3
+from collections import deque
 from urllib.parse import urlparse, parse_qs
 from aiohttp import web
 import aiohttp
@@ -14,6 +15,7 @@ asyncio.set_event_loop(loop)
 
 from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
+from telethon.errors import FloodWaitError
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
 
@@ -27,7 +29,6 @@ SESSION_STRING = os.environ.get("SESSION_STRING", "")
 TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "")
 OMDB_API_KEY = os.environ.get("OMDB_API_KEY", "")
 
-# Strip '@' if accidentally included in environment variable
 SOURCE_BOT = os.environ.get("SOURCE_BOT", "fileserverxrobot").lstrip("@").strip()
 PORT = int(os.environ.get("PORT", 10000))
 
@@ -65,20 +66,40 @@ INDIAN_LANG_CODES = {"hi", "te", "ta", "ml", "kn", "bn", "mr", "pa", "gu", "ur"}
 
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH, loop=loop)
 
-# Operational State Synchronization
+# Operational State & Queue Synchronization
 FILE_COMPLETED_EVENT = asyncio.Event()
 CAPTURED_FILES = set()
+META_CACHE = {}
+TITLE_QUEUE = deque()
 CURRENT_PIPELINE_ACTIVE = False
 ACTIVE_CLEAN_TITLE = ""
+ACTIVE_SEASON_TAG = "S01"
+ACTIVE_EP_TAG = ""
 
 # ============================================================================
 # 2. LOCAL DEDUPLICATION DATABASE (SQLITE)
 # ============================================================================
 def normalize_title_key(title: str) -> str:
     clean = re.sub(r"\(\d{4}\)", "", title or "")
-    clean = re.sub(r"\b(S\d{1,2}|E\d{1,3}|1080p|720p|480p|360p|BluRay|Pahe|MKV|MP4|HEVC|x265|x264|10Bit)\b.*$", "", clean, flags=re.I)
+    clean = re.sub(
+        r"\b(S\d{1,2}|Season\s*\d+|E\d{1,3}|Episode\s*\d+|1080p|720p|480p|360p|BluRay|Pahe|MKV|MP4|HEVC|x265|x264|10Bit|WEB-DL|HDRip)\b.*$",
+        "",
+        clean,
+        flags=re.I
+    )
     clean = re.sub(r"[^a-zA-Z0-9]+", " ", clean).strip().lower()
     return clean or "unknown"
+
+def extract_season_ep_tag(text: str, default_season: str = "S01") -> str:
+    """Normalizes episode tags to S01E01 format so Season 1 and Season 2 never collide."""
+    s_m = re.search(r"\b(?:S|Season\s*)0*(\d{1,2})\b", text or "", re.I)
+    e_m = re.search(r"\b(?:E|EP|Episode\s*)0*(\d{1,3})\b", text or "", re.I)
+
+    s_tag = f"S{int(s_m.group(1)):02d}" if s_m else default_season.upper()
+    if e_m:
+        e_tag = f"E{int(e_m.group(1)):02d}"
+        return f"{s_tag}{e_tag}"
+    return "MOVIE"
 
 def init_storage_db():
     conn = sqlite3.connect("storage_index.db")
@@ -218,18 +239,21 @@ def build_final_caption(filename, caption, meta_runtime=""):
     return "\n".join(lines)
 
 # ============================================================
-# 4. METADATA RESOLVER & CATEGORIZATION (TMDB + OMDB)
+# 4. METADATA RESOLVER & CATEGORIZATION (WITH MEMORY CACHE)
 # ============================================================
 async def fetch_meta(title):
     clean = normalize_title_key(title)
+    if clean in META_CACHE:
+        return META_CACHE[clean]
+
     genres, lang, runtime = "", "", ""
-    is_series = bool(re.search(r"\b(S\d{1,2}\s*E\d{1,3}|Season|Episode)\b", title, re.I))
+    is_series = bool(re.search(r"\b(S\d{1,2}|Season|E\d{1,3}|Episode)\b", title, re.I))
 
     async with aiohttp.ClientSession() as session:
         if TMDB_API_KEY:
             try:
                 url = f"https://api.themoviedb.org/3/search/multi?api_key={TMDB_API_KEY}&query={clean}"
-                async with session.get(url, timeout=5) as r:
+                async with session.get(url, timeout=3) as r:
                     if r.status == 200:
                         data = await r.json()
                         res = (data.get("results") or [{}])[0]
@@ -242,7 +266,7 @@ async def fetch_meta(title):
         if OMDB_API_KEY:
             try:
                 url = f"https://www.omdbapi.com/?apikey={OMDB_API_KEY}&t={clean}"
-                async with session.get(url, timeout=5) as r:
+                async with session.get(url, timeout=3) as r:
                     if r.status == 200:
                         data = await r.json()
                         if data.get("Response") == "True":
@@ -253,7 +277,9 @@ async def fetch_meta(title):
             except Exception:
                 pass
 
-    return {"title": clean, "genres": genres, "language": lang, "runtime": runtime, "is_series": is_series}
+    result = {"title": clean, "genres": genres, "language": lang, "runtime": runtime, "is_series": is_series}
+    META_CACHE[clean] = result
+    return result
 
 def detect_category(filename, caption, meta):
     combined = f"{filename} {caption} {meta.get('genres', '')}".lower()
@@ -291,8 +317,40 @@ def detect_category(filename, caption, meta):
     return "english"
 
 # ============================================================================
-# 5. DYNAMIC BUTTON EVALUATION (RANKING RESOLUTIONS & EPISODE SIZES)
+# 5. SMART BUTTON SCORING (TITLES, SEASONS, QUALITIES, SIZES)
 # ============================================================================
+def select_best_title_button(buttons, query: str):
+    """Selects the best matching title button (preferring 📺 Series packs over raw single MKVs)."""
+    clean_q = normalize_title_key(query)
+    candidates = []
+
+    for row in buttons:
+        for btn in row:
+            txt = (btn.text or "").strip()
+            low = txt.lower()
+            if any(skip in low for skip in ["back", "close", "next", "page"]):
+                continue
+
+            score = 0
+            btn_clean = normalize_title_key(txt)
+            if btn_clean == clean_q:
+                score += 500
+            elif clean_q in btn_clean:
+                score += 300
+
+            # Prefer multi-season / series entries ("📺 Solo Leveling - 3 Seasons") over raw single files ("01 Mkv")
+            if "📺" in txt or "season" in low:
+                score += 250
+            if re.search(r"\b\d{2}\s*mkv\b", low):
+                score -= 200
+
+            candidates.append((score, btn))
+
+    if candidates:
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return candidates[0][1]
+    return buttons[0][0]
+
 def score_quality_button(text: str) -> int:
     t = text.upper()
     score = 0
@@ -303,8 +361,11 @@ def score_quality_button(text: str) -> int:
 
     if "BLURAY" in t or "BD" in t: score += 200
     elif "WEB-DL" in t: score += 150
+    elif "HDRIP" in t: score += 120
 
-    if "HEVC" in t or "X265" in t or "10BIT" in t: score += 50
+    if "HEVC" in t or "X265" in t or "10BIT" in t: score += 60
+    # Slight penalty to PAHE so pure BluRay HEVC ("1080P BLURAY HEVC QUALITY") wins first
+    if "PAHE" in t: score -= 10
     return score
 
 def select_best_quality_button(buttons):
@@ -324,8 +385,7 @@ def select_best_quality_button(buttons):
     return None
 
 def parse_size_mb(text: str) -> float:
-    """Extracts file size in MB from button text like 'E01 [1.54 GB]' or 'E01 [269.21 MB]'."""
-    m = re.search(r"(\d+(?:\.\d+)?)\s*(GB|MB|KB)", text, re.I)
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(GB|MB|KB)", text or "", re.I)
     if not m:
         return 0.0
     val = float(m.group(1))
@@ -337,7 +397,7 @@ def parse_size_mb(text: str) -> float:
     return val
 
 # ============================================================================
-# 6. AUTO-JOIN CHANNELS & CALLBACK DEEP-LINK HANDLER
+# 6. AUTO-JOIN CHANNELS & NON-HANGING BUTTON CLICKER
 # ============================================================================
 async def auto_join_channel(url: str):
     try:
@@ -356,7 +416,6 @@ async def auto_join_channel(url: str):
         return False
 
 async def trigger_start_url(url: str) -> bool:
-    """Parses a t.me/bot?start=XYZ deep-link and sends '/start XYZ' to the target bot."""
     if not url or "start=" not in url:
         return False
     parsed = urlparse(url)
@@ -369,21 +428,61 @@ async def trigger_start_url(url: str) -> bool:
     return False
 
 async def smart_click_button(btn):
-    """Clicks a button and automatically follows callback URL redirects if returned."""
+    """Clicks an inline button with a 2.5s timeout so Telethon never hangs waiting for a popup."""
     if getattr(btn, "url", None):
         if "start=" in btn.url:
             return await trigger_start_url(btn.url)
         return False
 
-    res = await btn.click()
-    # Critical Fix: If the bot answers the callback query with a ?start= URL, trigger it!
-    res_url = getattr(res, "url", None)
-    if res_url and "start=" in res_url:
-        await trigger_start_url(res_url)
+    try:
+        res = await asyncio.wait_for(btn.click(), timeout=2.5)
+        res_url = getattr(res, "url", None)
+        if res_url and "start=" in res_url:
+            await trigger_start_url(res_url)
+    except asyncio.TimeoutError:
+        pass
+    except FloodWaitError as fw:
+        print(f"⏳ FloodWait during click: sleeping {fw.seconds}s...")
+        await asyncio.sleep(fw.seconds + 1)
+    except Exception as e:
+        print(f"⚠️ Button click notice: {e}")
     return True
 
+def get_menu_signature(msg) -> str:
+    if not msg or not msg.buttons:
+        return ""
+    btns = "|".join(b.text or "" for r in msg.buttons for b in r)
+    return f"{msg.id}:{msg.text or ''}:{btns}"
+
+async def find_latest_menu_message(bot_entity, tracked_msg_id=None):
+    """Finds the active menu message even when video files or warning messages are posted below it."""
+    if tracked_msg_id:
+        msg = await client.get_messages(bot_entity, ids=tracked_msg_id)
+        if msg and msg.buttons:
+            return msg
+
+    msgs = await client.get_messages(bot_entity, limit=10)
+    for m in msgs:
+        if not m or not m.buttons:
+            continue
+        btn_texts = [b.text or "" for r in m.buttons for b in r]
+        if len(btn_texts) == 1 and "auto-delete" in btn_texts[0].lower():
+            continue
+        return m
+    return None
+
+async def wait_for_menu_update(bot_entity, tracked_msg_id, old_sig: str, max_wait: float = 4.5):
+    """Polls every 0.4s and returns immediately the moment the menu buttons change."""
+    loops = int(max_wait / 0.4)
+    for _ in range(loops):
+        await asyncio.sleep(0.4)
+        msg = await find_latest_menu_message(bot_entity, tracked_msg_id)
+        if msg and get_menu_signature(msg) != old_sig:
+            return msg
+    return await find_latest_menu_message(bot_entity, tracked_msg_id)
+
 # ============================================================================
-# 7. INCOMING MEDIA EVENT (INTERCEPT, FORWARD & UNBLOCK QUEUE)
+# 7. INCOMING MEDIA EVENT (INTERCEPT, DEDUPLICATE, FORWARD & UNBLOCK)
 # ============================================================================
 @client.on(events.NewMessage(incoming=True))
 async def on_media_arrival(event):
@@ -408,10 +507,21 @@ async def on_media_arrival(event):
 
     print(f"📥 Received file: {raw_fn}")
 
-    meta = await fetch_meta(raw_fn)
+    title_for_meta = ACTIVE_CLEAN_TITLE or raw_fn
+    meta = await fetch_meta(title_for_meta)
     cat = detect_category(raw_fn, caption, meta)
     dest_channel = DEFAULT_CHANNELS.get(cat, DEFAULT_CHANNELS["other"])
     cat_emoji = CATEGORY_EMOJIS.get(cat, "📁")
+
+    # Determine exact Season+Episode tag (e.g., S01E01)
+    ep_tag = ACTIVE_EP_TAG or extract_season_ep_tag(f"{raw_fn} {caption}", ACTIVE_SEASON_TAG)
+    title_key = ACTIVE_CLEAN_TITLE or meta["title"]
+
+    # Double-check duplicate before uploading
+    if is_already_indexed(dest_channel, title_key, ep_tag):
+        print(f"⏭️ Duplicate file intercepted ({title_key} {ep_tag}) — skipping upload.")
+        FILE_COMPLETED_EVENT.set()
+        return
 
     final_caption = build_final_caption(raw_fn, caption, meta.get("runtime", ""))
 
@@ -423,158 +533,142 @@ async def on_media_arrival(event):
             buttons=INLINE_BUTTONS,
             parse_mode="HTML"
         )
-        print(f"🚀 Published to {cat_emoji} {cat.upper()} channel ({dest_channel})")
+        print(f"🚀 Published {ep_tag} to {cat_emoji} {cat.upper()} channel ({dest_channel})")
 
-        ep_m = re.search(r"\b(E\d{1,3})\b", f"{raw_fn} {caption}", re.I)
-        ep_tag = ep_m.group(1).upper() if ep_m else "MOVIE"
-        title_key = ACTIVE_CLEAN_TITLE or meta["title"]
         record_indexed_file(dest_channel, title_key, ep_tag, raw_fn)
 
         await client.send_message(
             "me",
             f"✅ <b>Published to Storage!</b>\n"
+            f"• <b>Title:</b> <code>{title_key.title()} ({ep_tag})</code>\n"
             f"• <b>File:</b> <code>{extract_real_filename(raw_fn, caption)}</code>\n"
             f"• <b>Channel:</b> {cat_emoji} <code>{cat.upper()}</code> ➔ <code>{dest_channel}</code>",
             parse_mode="HTML"
         )
+    except FloodWaitError as fw:
+        print(f"⏳ FloodWait on upload: sleeping {fw.seconds}s...")
+        await asyncio.sleep(fw.seconds + 1)
     except Exception as e:
         print(f"❌ Storage Forward error: {e}")
     finally:
         FILE_COMPLETED_EVENT.set()
 
 # ============================================================================
-# 8. STATE-DRIVEN NAVIGATION & SEQUENTIAL DELIVERY LOOP
+# 8. AUTO-RECOVERY NAVIGATOR (RE-SENDS TITLE IF MENU EXPIRES OR NEXT SEASON)
 # ============================================================================
-async def find_latest_menu_message(bot_entity, tracked_msg_id=None):
-    """Finds the active inline menu message even if files/warnings were sent below it."""
-    if tracked_msg_id:
-        msg = await client.get_messages(bot_entity, ids=tracked_msg_id)
-        if msg and msg.buttons:
-            return msg
+async def navigate_to_episode_grid(query: str, target_season_num: int = 1, send_fresh: bool = True):
+    """
+    Sends the title (if send_fresh=True) and clicks through:
+    Title ➔ Season (target_season_num) ➔ Best Quality ➔ Returns the Episode Grid message.
+    """
+    if send_fresh:
+        print(f"📨 Sending search query to @{SOURCE_BOT}: '{query}' (Target: Season {target_season_num:02d})")
+        await client.send_message(SOURCE_BOT, query)
+        await asyncio.sleep(2.0)
 
-    msgs = await client.get_messages(bot_entity, limit=8)
-    for m in msgs:
-        if not m or not m.buttons:
+    tracked_menu_id = None
+    available_seasons = []
+
+    for _ in range(15):
+        msg = await find_latest_menu_message(SOURCE_BOT, tracked_menu_id)
+        if not msg or not msg.buttons:
+            await asyncio.sleep(1.0)
             continue
-        # Ignore the single red "Auto-Delete in 1 min" button on delivered files
-        btn_texts = [b.text or "" for r in m.buttons for b in r]
-        if len(btn_texts) == 1 and "auto-delete" in btn_texts[0].lower():
-            continue
-        return m
-    return None
 
-async def execute_autonomous_pipeline(query: str, send_initial_query: bool = True):
-    global CURRENT_PIPELINE_ACTIVE, ACTIVE_CLEAN_TITLE
-    if CURRENT_PIPELINE_ACTIVE:
-        print("⚠️ Pipeline already active, ignoring duplicate trigger.")
-        return
+        tracked_menu_id = msg.id
+        text = (msg.text or "").lower()
+        old_sig = get_menu_signature(msg)
 
-    CURRENT_PIPELINE_ACTIVE = True
-    ACTIVE_CLEAN_TITLE = normalize_title_key(query)
-    print(f"🎬 Initializing autonomous pipeline for: {query}")
+        # 1. Bypass Force-Subscribe (FSUB) if prompted
+        joined = False
+        for row in msg.buttons:
+            for btn in row:
+                if getattr(btn, "url", None) and "t.me/" in btn.url:
+                    t = (btn.text or "").lower()
+                    if any(w in t for w in ["join", "channel", "subscribe", "backup"]):
+                        await auto_join_channel(btn.url)
+                        joined = True
+                        await asyncio.sleep(1.0)
 
-    try:
-        if send_initial_query:
-            await client.send_message(SOURCE_BOT, query)
-        await asyncio.sleep(3.5)
-
-        tracked_menu_id = None
-
-        # Stage 1: Traverse Menus (Title ➔ Season ➔ Quality ➔ Episode Grid)
-        for step in range(15):
-            msg = await find_latest_menu_message(SOURCE_BOT, tracked_menu_id)
-            if not msg or not msg.buttons:
-                await asyncio.sleep(2.5)
-                continue
-
-            tracked_menu_id = msg.id
-            text = (msg.text or "").lower()
-
-            # Check for Force-Subscribe (FSUB) join buttons
-            joined = False
+        if joined:
             for row in msg.buttons:
                 for btn in row:
-                    if getattr(btn, "url", None) and "t.me/" in btn.url:
-                        t = (btn.text or "").lower()
-                        if any(w in t for w in ["join", "channel", "subscribe", "backup"]):
-                            await auto_join_channel(btn.url)
-                            joined = True
-                            await asyncio.sleep(1.5)
+                    if any(w in (btn.text or "").lower() for w in ["try again", "joined", "refresh", "check"]):
+                        await smart_click_button(btn)
+                        await wait_for_menu_update(SOURCE_BOT, tracked_menu_id, old_sig)
+                        break
+            continue
 
-            if joined:
-                for row in msg.buttons:
-                    for btn in row:
-                        if any(w in (btn.text or "").lower() for w in ["try again", "joined", "refresh", "check"]):
-                            await smart_click_button(btn)
-                            await asyncio.sleep(3.5)
-                            break
+        # 2. Screen D: Episode Matrix Reached
+        has_ep_buttons = any(re.search(r"\bE\d{1,3}\b", b.text or "", re.I) for r in msg.buttons for b in r)
+        if "total episodes" in text or has_ep_buttons:
+            return msg, available_seasons
+
+        # 3. Screen A: Title Selection
+        if "choose the correct title" in text or "matching results" in text or "search results for" in text:
+            best_title_btn = select_best_title_button(msg.buttons, query)
+            print(f"👉 [Screen 1/Title] Clicking: {best_title_btn.text}")
+            await smart_click_button(best_title_btn)
+            await wait_for_menu_update(SOURCE_BOT, tracked_menu_id, old_sig)
+            continue
+
+        # 4. Screen B: Season Selection
+        if "choose the season" in text or any("season" in (b.text or "").lower() for r in msg.buttons for b in r):
+            season_btns = {}
+            fallback_btn = None
+            for row in msg.buttons:
+                for btn in row:
+                    t = (btn.text or "").strip()
+                    low = t.lower()
+                    if "close" in low or "back" in low:
+                        continue
+                    m = re.search(r"season\s*0*(\d+)", low)
+                    if m:
+                        s_num = int(m.group(1))
+                        season_btns[s_num] = btn
+                    elif "season all" in low:
+                        fallback_btn = btn
+
+            available_seasons = sorted(season_btns.keys())
+            chosen_btn = season_btns.get(target_season_num) or fallback_btn or msg.buttons[0][0]
+            print(f"👉 [Screen 2/Season] Clicking: {chosen_btn.text}")
+            await smart_click_button(chosen_btn)
+            await wait_for_menu_update(SOURCE_BOT, tracked_menu_id, old_sig)
+            continue
+
+        # 5. Screen C: Quality Selection
+        if "select the available quality" in text or "quality" in text:
+            best_qual = select_best_quality_button(msg.buttons)
+            if best_qual:
+                print(f"👉 [Screen 3/Quality] Clicking: {best_qual.text}")
+                await smart_click_button(best_qual)
+                await wait_for_menu_update(SOURCE_BOT, tracked_menu_id, old_sig)
                 continue
-
-            # Screen D: Episode Grid Reached (Check this FIRST in case header contains 'Season' or 'Quality')
-            has_ep_buttons = any(re.search(r"\bE\d{1,3}\b", b.text or "", re.I) for r in msg.buttons for b in r)
-            if "total episodes" in text or has_ep_buttons:
-                print("📦 Episode Matrix identified. Handing off to sequential downloader...")
-                await run_episode_queue(msg, query)
+            else:
+                print("❌ No valid quality buttons found.")
                 break
 
-            # Screen A: Title Selection
-            if "choose the correct title" in text or "matching results" in text or "search results for" in text:
-                first_btn = msg.buttons[0][0]
-                print(f"👉 [Screen A] Selecting Title: {first_btn.text}")
-                await smart_click_button(first_btn)
-                await asyncio.sleep(3.5)
-                continue
+        await asyncio.sleep(1.0)
 
-            # Screen B: Season Selection
-            if "choose the season" in text or any("season" in (b.text or "").lower() for r in msg.buttons for b in r):
-                target_season = None
-                for row in msg.buttons:
-                    for btn in row:
-                        t = (btn.text or "").lower()
-                        if "season 01" in t or "season 1" in t:
-                            target_season = btn
-                            break
-                    if target_season:
-                        break
+    return None, available_seasons
 
-                if not target_season:
-                    target_season = msg.buttons[0][0]
-
-                print(f"👉 [Screen B] Selecting Season: {target_season.text}")
-                await smart_click_button(target_season)
-                await asyncio.sleep(3.5)
-                continue
-
-            # Screen C: Quality Selection
-            if "select the available quality" in text or "quality" in text:
-                best_qual = select_best_quality_button(msg.buttons)
-                if best_qual:
-                    print(f"👉 [Screen C] Selecting Quality: {best_qual.text}")
-                    await smart_click_button(best_qual)
-                    await asyncio.sleep(3.5)
-                    continue
-                else:
-                    print("❌ No valid quality options found.")
-                    break
-
-            await asyncio.sleep(2.5)
-
-    except Exception as e:
-        print(f"⚠️ Pipeline execution error: {e}")
-    finally:
-        CURRENT_PIPELINE_ACTIVE = False
-
-async def run_episode_queue(initial_msg, clean_title: str):
+# ============================================================================
+# 9. SEQUENTIAL EPISODE DOWNLOADER WITH PAGE-SPLIT & AUTO-CONTINUATION
+# ============================================================================
+async def download_season_episodes(initial_msg, query: str, season_num: int):
+    global ACTIVE_SEASON_TAG, ACTIVE_EP_TAG
+    ACTIVE_SEASON_TAG = f"S{season_num:02d}"
     menu_msg_id = initial_msg.id
     current_msg = initial_msg
+    current_page = 1
 
-    meta = await fetch_meta(clean_title)
-    cat = detect_category(clean_title, "", meta)
+    meta = await fetch_meta(query)
+    cat = detect_category(query, "", meta)
     dest_channel = DEFAULT_CHANNELS.get(cat, DEFAULT_CHANNELS["other"])
 
     while True:
-        # Group episodes by tag (E01, E02...) and pick the largest file size for each
         best_ep_map = {}
+        ep_counts = {}
         ep_order = []
         next_button = None
 
@@ -588,106 +682,177 @@ async def run_episode_queue(initial_msg, clean_title: str):
                     next_button = btn
                     continue
 
-                m = re.search(r"\b(E\d{1,3})\b", txt, re.I)
-                ep_tag = m.group(1).upper() if m else txt
+                m = re.search(r"\bE0*(\d{1,3})\b", txt, re.I)
+                if m:
+                    ep_tag = f"{ACTIVE_SEASON_TAG}E{int(m.group(1)):02d}"
+                else:
+                    ep_tag = f"{ACTIVE_SEASON_TAG}_{txt}"
+
                 size_mb = parse_size_mb(txt)
+                ep_counts[ep_tag] = ep_counts.get(ep_tag, 0) + 1
 
                 if ep_tag not in best_ep_map:
                     ep_order.append(ep_tag)
                     best_ep_map[ep_tag] = (size_mb, btn)
                 else:
-                    # Keep the button with the largest file size (e.g., 1.54 GB over 269 MB)
                     if size_mb > best_ep_map[ep_tag][0]:
                         best_ep_map[ep_tag] = (size_mb, btn)
 
+        # Page-Boundary Split Fix (e.g., E04 [368 MB] at end of Page 1 when E04 [1.6 GB] is on Page 2)
+        if next_button and len(ep_order) >= 2:
+            last_tag = ep_order[-1]
+            last_size = best_ep_map[last_tag][0]
+            prev_sizes = [best_ep_map[t][0] for t in ep_order[:-1] if best_ep_map[t][0] > 0]
+            avg_prev_size = (sum(prev_sizes) / len(prev_sizes)) if prev_sizes else 0
+
+            if ep_counts.get(last_tag, 0) == 1 and avg_prev_size > 0 and last_size < (avg_prev_size * 0.55):
+                print(f"💡 Deferring {last_tag} ({last_size:.0f} MB) to next page so we grab its full-size BluRay version.")
+                ep_order.pop()
+
         episode_buttons = [(tag, best_ep_map[tag][1]) for tag in ep_order]
-        print(f"📋 Selected {len(episode_buttons)} unique episodes on current page.")
+        print(f"📋 [{ACTIVE_SEASON_TAG} • Page {current_page}] Found {len(episode_buttons)} episodes to process.")
 
         for ep_tag, btn in episode_buttons:
-            if is_already_indexed(dest_channel, clean_title, ep_tag):
-                print(f"⏭️ Skipping {ep_tag} — already in storage channel ({dest_channel}).")
+            if is_already_indexed(dest_channel, ACTIVE_CLEAN_TITLE, ep_tag):
+                print(f"⏭️ Skipping {ep_tag} — already indexed in channel ({dest_channel}).")
                 continue
 
+            ACTIVE_EP_TAG = ep_tag
             FILE_COMPLETED_EVENT.clear()
-            print(f"⏳ Triggering {ep_tag} ({btn.text})...")
+            print(f"⏳ Requesting {ep_tag} ➔ Clicking '{btn.text}'...")
 
-            try:
-                await smart_click_button(btn)
-            except Exception as err:
-                print(f"⚠️ Click error on {ep_tag}: {err}")
-                continue
+            await smart_click_button(btn)
 
             try:
                 await asyncio.wait_for(FILE_COMPLETED_EVENT.wait(), timeout=90)
-                print(f"✅ {ep_tag} completed successfully.")
+                print(f"✅ {ep_tag} forwarded and indexed!")
             except asyncio.TimeoutError:
-                print(f"⚠️ Delivery timed out for {ep_tag}. Checking if FSUB appeared...")
-                # Check if clicking the episode prompted an FSUB join message
-                latest = await client.get_messages(SOURCE_BOT, limit=2)
-                for lm in latest:
-                    if lm and lm.buttons:
-                        for r in lm.buttons:
-                            for b in r:
-                                if getattr(b, "url", None) and "t.me/" in b.url:
-                                    await auto_join_channel(b.url)
+                print(f"⚠️ Timeout on {ep_tag}. Checking if menu expired or FSUB appeared...")
 
-            await asyncio.sleep(4.0)
-            # Refresh menu message reference by its exact ID so buttons stay fresh
-            refreshed = await client.get_messages(SOURCE_BOT, ids=menu_msg_id)
-            if refreshed and refreshed.buttons:
-                current_msg = refreshed
+            await asyncio.sleep(1.5)
 
-        # Pagination: Move to next page using the tracked menu message ID
+            # Check if the menu message is still alive; if deleted/expired, re-send title & recover!
+            check_msg = await client.get_messages(SOURCE_BOT, ids=menu_msg_id)
+            if not check_msg or not check_msg.buttons:
+                print(f"🔄 Menu message expired! Re-sending title '{query}' to continue remaining episodes...")
+                recovered_msg, _ = await navigate_to_episode_grid(query, season_num, send_fresh=True)
+                if recovered_msg:
+                    menu_msg_id = recovered_msg.id
+                    current_msg = recovered_msg
+                    # Navigate back to current_page if we were on page > 1
+                    for _ in range(1, current_page):
+                        nxt = next((b for r in current_msg.buttons for b in r if "next" in (b.text or "").lower() or "⏩" in (b.text or "")), None)
+                        if nxt:
+                            old_s = get_menu_signature(current_msg)
+                            await smart_click_button(nxt)
+                            current_msg = await wait_for_menu_update(SOURCE_BOT, menu_msg_id, old_s)
+
+        # Refresh menu before clicking Next Page
+        refreshed = await client.get_messages(SOURCE_BOT, ids=menu_msg_id)
+        if refreshed and refreshed.buttons:
+            current_msg = refreshed
+            next_button = next((b for r in current_msg.buttons for b in r if "next" in (b.text or "").lower() or "⏩" in (b.text or "")), None)
+
         if next_button:
-            print("📄 Navigating to Next Page...")
-            try:
-                await smart_click_button(next_button)
-                await asyncio.sleep(4.0)
-                current_msg = await client.get_messages(SOURCE_BOT, ids=menu_msg_id)
-                if not current_msg or not current_msg.buttons:
-                    break
-            except Exception as err:
-                print(f"⚠️ Pagination error: {err}")
+            current_page += 1
+            print(f"📄 Clicking Next ⏩ to load Page {current_page}...")
+            old_sig = get_menu_signature(current_msg)
+            await smart_click_button(next_button)
+            current_msg = await wait_for_menu_update(SOURCE_BOT, menu_msg_id, old_sig)
+            if not current_msg or not current_msg.buttons:
                 break
         else:
-            print(f"🎉 Completed all pages and episodes for: {clean_title}")
-            await client.send_message(
-                "me",
-                f"🏁 <b>Extraction Finished:</b> All available episodes of <code>{clean_title}</code> processed.",
-                parse_mode="HTML"
-            )
+            print(f"✅ Finished all pages for {query} ({ACTIVE_SEASON_TAG}).")
             break
 
 # ============================================================================
-# 9. TRIGGERS: SAVED MESSAGES OR DIRECTLY IN SOURCE_BOT CHAT
+# 10. MASTER PIPELINE & QUEUE WORKER
+# ============================================================================
+async def process_queue():
+    global CURRENT_PIPELINE_ACTIVE, ACTIVE_CLEAN_TITLE, ACTIVE_EP_TAG
+    if CURRENT_PIPELINE_ACTIVE:
+        return
+
+    CURRENT_PIPELINE_ACTIVE = True
+    try:
+        while TITLE_QUEUE:
+            query, send_initial = TITLE_QUEUE.popleft()
+            ACTIVE_CLEAN_TITLE = normalize_title_key(query)
+            ACTIVE_EP_TAG = ""
+
+            # Check if user explicitly asked for a specific season (e.g., "Solo Leveling S02")
+            explicit_s = re.search(r"\b(?:S|Season\s*)0*(\d{1,2})\b", query, re.I)
+            start_season = int(explicit_s.group(1)) if explicit_s else 1
+
+            ep_msg, all_seasons = await navigate_to_episode_grid(query, start_season, send_fresh=send_initial)
+            if not ep_msg:
+                print(f"❌ Could not reach episode grid for: {query}")
+                continue
+
+            await download_season_episodes(ep_msg, query, start_season)
+
+            # If the user didn't specify a single season and the series has more seasons (Season 02, 03...),
+            # automatically re-send the title to download the remaining seasons!
+            if not explicit_s and len(all_seasons) > 1:
+                for next_s in all_seasons:
+                    if next_s <= start_season:
+                        continue
+                    print(f"🔁 Re-sending '{query}' to start Season {next_s:02d}...")
+                    await asyncio.sleep(2.0)
+                    next_ep_msg, _ = await navigate_to_episode_grid(query, next_s, send_fresh=True)
+                    if next_ep_msg:
+                        await download_season_episodes(next_ep_msg, query, next_s)
+
+            await client.send_message(
+                "me",
+                f"🏁 <b>Extraction Finished:</b> All episodes of <code>{query}</code> have been processed!",
+                parse_mode="HTML"
+            )
+    except Exception as e:
+        print(f"⚠️ Master pipeline error: {e}")
+    finally:
+        CURRENT_PIPELINE_ACTIVE = False
+        ACTIVE_EP_TAG = ""
+
+def enqueue_title(query: str, send_initial: bool = True):
+    TITLE_QUEUE.append((query, send_initial))
+    asyncio.create_task(process_queue())
+
+# ============================================================================
+# 11. TRIGGERS: SAVED MESSAGES OR TYPING IN SOURCE_BOT CHAT
 # ============================================================================
 @client.on(events.NewMessage(outgoing=True))
 async def on_outgoing_trigger(event):
     text = (event.message.text or "").strip()
-    if not text or text.startswith(("/", "✅", "⏳", "🏁", "⚠️")):
+    if not text or text.startswith(("/", "✅", "⏳", "🏁", "⚠️", "🔗")):
         return
 
-    # Case 1: Sent to Saved Messages ("me")
-    if event.chat_id == (await client.get_me()).id:
+    me = await client.get_me()
+    if event.chat_id == me.id:
         query = re.sub(r"^\.get\s+", "", text, flags=re.I).strip()
-        await event.reply(f"⏳ <b>Autonomous pipeline started:</b> <code>{query}</code>", parse_mode="HTML")
-        asyncio.create_task(execute_autonomous_pipeline(query, send_initial_query=True))
+        pos = len(TITLE_QUEUE) + (1 if CURRENT_PIPELINE_ACTIVE else 0)
+        await event.reply(
+            f"⏳ <b>Added to Autonomous Queue (#{pos}):</b> <code>{query}</code>",
+            parse_mode="HTML"
+        )
+        enqueue_title(query, send_initial=True)
         return
 
-    # Case 2: Typed directly inside the SOURCE_BOT chat (like in your screenshots!)
     chat = await event.get_chat()
     chat_username = (getattr(chat, "username", "") or "").lower()
-    if chat_username == SOURCE_BOT.lower():
-        print(f"🎯 Detected manual search in @{SOURCE_BOT}: {text}")
-        asyncio.create_task(execute_autonomous_pipeline(text, send_initial_query=False))
+    if chat_username == SOURCE_BOT.lower() and not CURRENT_PIPELINE_ACTIVE:
+        print(f"🎯 Manual search detected in @{SOURCE_BOT}: {text}")
+        enqueue_title(text, send_initial=False)
 
 # ============================================================================
-# 10. RENDER HEALTH CHECK SERVER & MAIN ENTRYPOINT
+# 12. RENDER HEALTH CHECK SERVER & MAIN ENTRYPOINT
 # ============================================================================
 async def handle_ping(request):
     return web.json_response({
         "status": "online",
         "pipeline_active": CURRENT_PIPELINE_ACTIVE,
+        "queue_length": len(TITLE_QUEUE),
+        "active_title": ACTIVE_CLEAN_TITLE,
         "service": "Autonomous Media Syndication Pipeline"
     })
 
