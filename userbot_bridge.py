@@ -1,16 +1,23 @@
 import os
 import asyncio
-import aiohttp
 from aiohttp import web
+import aiohttp
 from urllib.parse import urlparse, parse_qs
+
+# ============================================================================
+# PYTHON 3.10+ / 3.12+ COMPATIBILITY: EXPLICIT EVENT LOOP CREATION
+# ============================================================================
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
+
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
 # ============================================================================
 # 1. CONFIGURATION (Read from Render Environment Variables)
 # ============================================================================
-API_ID = int(os.environ.get("API_ID", "0"))
-API_HASH = os.environ.get("API_HASH", "")
+API_ID = int(os.environ.get("API_ID", "7598862"))
+API_HASH = os.environ.get("API_HASH", "fea8fb2a9cb4d31ff6f53e2d499801ee")
 SESSION_STRING = os.environ.get("SESSION_STRING", "")
 
 # Your Cloudflare Worker URL
@@ -19,11 +26,11 @@ USERBOT_SECRET = os.environ.get("USERBOT_SECRET", "backroom_secret_2026")
 TARGET_DESTINATION = os.environ.get("TARGET_DESTINATION", "@YourBotUsername")
 SOURCE_BOT = "fileserverxrobot"
 
-# Port assigned by Render (defaults to 10000)
+# Port assigned by Render
 PORT = int(os.environ.get("PORT", 10000))
 
-# Initialize Telethon Client using StringSession
-client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+# Initialize Telethon Client using StringSession on our explicit loop
+client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH, loop=loop)
 
 def parse_target(dest):
     if str(dest).lstrip("-").isdigit():
@@ -42,7 +49,7 @@ async def on_incoming_file(event):
         return
 
     file_size = event.file.size if event.file else 0
-    if file_size < 5 * 1024 * 1024:  # Ignore small files / stickers (< 5MB)
+    if file_size < 5 * 1024 * 1024:
         return
 
     dest = parse_target(TARGET_DESTINATION)
@@ -79,11 +86,9 @@ async def pull_movie_from_fileserver(query: str, max_files: int = 15) -> int:
                         break
                     btn_text = btn.text or ""
 
-                    # Skip non-media buttons
                     if any(skip in btn_text.lower() for skip in ["join", "channel", "help", "close", "donate"]):
                         continue
 
-                    # Deep-link start button (e.g. t.me/bot?start=...)
                     if getattr(btn, "url", None) and "t.me/" in btn.url and "start=" in btn.url:
                         parsed_url = urlparse(btn.url)
                         bot_uname = parsed_url.path.strip("/")
@@ -94,7 +99,6 @@ async def pull_movie_from_fileserver(query: str, max_files: int = 15) -> int:
                             clicked += 1
                             await asyncio.sleep(2)
 
-                    # Inline callback buttons
                     elif getattr(btn, "data", None):
                         if any(nav in btn_text.lower() for nav in ["next", "back", "page"]):
                             continue
@@ -144,7 +148,7 @@ async def poll_cloudflare_worker():
                                 "chat_id": job.get("chat_id"),
                                 "notify_text": f"✅ <b>Finished:</b> <code>{query}</code> ({count} actions triggered)."
                             })
-            except Exception as e:
+            except Exception:
                 pass
             await asyncio.sleep(6)
 
@@ -172,20 +176,18 @@ async def start_health_server():
 # 7. MAIN ENTRYPOINT
 # ============================================================================
 async def main():
-    # Start web server for Render
     await start_health_server()
 
-    # Start Telegram client
+    if not SESSION_STRING:
+        print("❌ ERROR: SESSION_STRING environment variable is missing in Render!")
+        return
+
     await client.start()
     print("🚀 Telethon Userbot is running and connected!")
     print(f"📡 Forwarding files from @{SOURCE_BOT} -> {TARGET_DESTINATION}")
 
-    # Start polling Cloudflare Worker in background
     asyncio.create_task(poll_cloudflare_worker())
-
-    # Keep the userbot active
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
     loop.run_until_complete(main())
