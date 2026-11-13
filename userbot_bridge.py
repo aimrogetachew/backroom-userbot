@@ -4,7 +4,7 @@ import json
 import asyncio
 import sqlite3
 from collections import deque
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote_plus
 from aiohttp import web
 import aiohttp
 
@@ -30,11 +30,11 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 
 TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "")
 OMDB_API_KEY = os.environ.get("OMDB_API_KEY", "")
+RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
 
 SOURCE_BOT = os.environ.get("SOURCE_BOT", "fileserverxrobot").lstrip("@").strip()
 PORT = int(os.environ.get("PORT", 10000))
 
-# Destination Storage Channels Mapping
 DEFAULT_CHANNELS = {
     "hindi": -1004364094932,
     "english": -1003900997247,
@@ -58,7 +58,6 @@ CATEGORY_EMOJIS = {
     "animation": "🧸", "upcoming": "🔔", "turkish": "🇹🇷", "other": "🎬"
 }
 
-# Fallback Telethon buttons (used if BOT_TOKEN is not set)
 INLINE_BUTTONS = [
     [
         Button.url("Series ↗", "https://t.me/thebackroomseries"),
@@ -67,7 +66,6 @@ INLINE_BUTTONS = [
     ]
 ]
 
-# Bot API 9.4 Exact Green ("style": "success") Inline Keyboard Markup
 GREEN_BOT_API_MARKUP = {
     "inline_keyboard": [
         [
@@ -83,21 +81,25 @@ INDIAN_LANG_CODES = {"hi", "te", "ta", "ml", "kn", "bn", "mr", "pa", "gu", "ur"}
 
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH, loop=loop)
 
-# Operational State & Queue Synchronization
+# Operational State & Synchronization
 FILE_COMPLETED_EVENT = asyncio.Event()
 CAPTURED_FILES = set()
 SYNCED_TITLES = set()
+DIALOG_CACHE_READY = False
 META_CACHE = {}
 TITLE_QUEUE = deque()
 
 CURRENT_PIPELINE_ACTIVE = False
+SKIP_CURRENT_TITLE = False
+ME_USER_ID = None
+
 ACTIVE_CLEAN_TITLE = ""
 ACTIVE_SEASON_TAG = "S01"
 ACTIVE_EP_TAG = ""
 ACTIVE_RES_TAG = ""
 
 # ============================================================================
-# 2. CROSS-CHANNEL DEDUPLICATION DATABASE + LIVE CHANNEL SCANNER
+# 2. NATURAL LANGUAGE COMMAND PARSER (RANGES, MISSING MODE, BULK LISTS)
 # ============================================================================
 def normalize_title_key(title: str) -> str:
     clean = re.sub(r"\(\d{4}\)|\[\d{4}\]", "", title or "")
@@ -110,6 +112,93 @@ def normalize_title_key(title: str) -> str:
     clean = re.sub(r"[^a-zA-Z0-9]+", " ", clean).strip().lower()
     return clean or "unknown"
 
+def parse_smart_user_command(raw_text: str) -> dict:
+    """
+    Parses natural language commands such as:
+    - 'missing files from solo leveling' -> mode='missing', title='solo leveling'
+    - 'Solo leveling from S2 ep 4 -5 EP 7' -> mode='range', title='Solo leveling', season=2, episodes={4, 5, 7}
+    - 'Blue Lock' -> mode='normal', title='Blue Lock'
+    """
+    text = re.sub(r"^\.get\s+", "", (raw_text or "").strip(), flags=re.I).strip()
+    text = re.sub(r"^[\d\-\*\•\.]+\s*", "", text).strip(" ,.;:")
+
+    mode = "normal"
+    season_num = None
+    target_episodes = set()
+
+    # 1. Detect "missing files from <Title>" mode
+    missing_m = re.match(
+        r"^(?:find\s+|check\s+|fill\s+|download\s+)?missing(?:\s+files?|\s+episodes?|\s+ep|\s+parts?|\s+movies?)?(?:\s+from|\s+in|\s+for|\s+of)?\s+(.+)$",
+        text,
+        flags=re.I
+    )
+    if missing_m:
+        mode = "missing"
+        text = missing_m.group(1).strip()
+    elif re.search(r"\bmissing(?:\s+files?|\s+episodes?|\s+ep|\s+parts?)?\b$", text, flags=re.I):
+        mode = "missing"
+        text = re.sub(r"\b(?:find|check|fill)?\s*missing(?:\s+files?|\s+episodes?|\s+ep|\s+parts?)?\b$", "", text, flags=re.I).strip()
+
+    # 2. Detect Season + Episode Range specifications (e.g. "from S2 ep 4 -5 EP 7")
+    tail_match = re.search(
+        r"\b(?:from\s+)?(?:(s(?:eason)?\s*0*\d{1,2})\b.*|(?:ep?(?:isode)?\.?\s*0*\d{1,3})\b.*)$",
+        text,
+        flags=re.I
+    )
+    if tail_match:
+        tail_str = tail_match.group(0)
+        title_part = text[:tail_match.start()].strip(" ,-:")
+        if len(title_part) >= 2:
+            s_m = re.search(r"\bs(?:eason)?\s*0*(\d{1,2})\b", tail_str, re.I)
+            if s_m:
+                season_num = int(s_m.group(1))
+
+            # Remove the season token before extracting episode numbers/ranges
+            ep_str = re.sub(r"\bs(?:eason)?\s*0*\d{1,2}\b", " ", tail_str, flags=re.I)
+
+            # Extract ranges like "ep 4 - 5", "4-7", "ep 2 to 6"
+            for r_m in re.finditer(r"(?:ep?(?:isode)?\.?\s*)?0*(\d{1,3})\s*(?:\-|to|–|~)\s*(?:ep?(?:isode)?\.?\s*)?0*(\d{1,3})", ep_str, re.I):
+                start_e, end_e = int(r_m.group(1)), int(r_m.group(2))
+                if start_e <= end_e and (end_e - start_e) <= 200:
+                    target_episodes.update(range(start_e, end_e + 1))
+
+            # Extract individual episodes like "EP 7", "ep 9", or comma-separated numbers
+            for single_m in re.finditer(r"(?:ep?(?:isode)?\.?\s*)0*(\d{1,3})\b", ep_str, re.I):
+                target_episodes.add(int(single_m.group(1)))
+
+            if season_num is not None or target_episodes:
+                text = title_part
+                if target_episodes and mode != "missing":
+                    mode = "range"
+
+    return {
+        "raw": raw_text.strip(),
+        "title": text.strip(" ,.") or raw_text.strip(),
+        "mode": mode,
+        "season": season_num,
+        "episodes": sorted(list(target_episodes)) if target_episodes else None
+    }
+
+def split_bulk_commands(raw_message: str) -> list:
+    """Splits multi-line and comma-separated titles while preserving episode lists like 'ep 4, 5, 7'."""
+    commands = []
+    for line in (raw_message or "").splitlines():
+        line = line.strip()
+        if not line or re.match(r"^[\.\s,]+$", line):
+            continue
+        # If the line has a trailing comma or multiple titles separated by commas (without 'ep' numbers)
+        if "," in line and not re.search(r"\b(?:ep?|episode|s\d{1,2})\b", line, re.I):
+            parts = [p.strip(" .,-") for p in line.split(",") if len(p.strip(" .,-")) >= 2]
+            commands.extend(parts)
+        else:
+            cleaned = line.strip(" .,-")
+            if len(cleaned) >= 2:
+                commands.append(cleaned)
+    return commands
+
+# ============================================================================
+# 3. LOCAL DEDUPLICATION DATABASE & SAFE CHANNEL SCANNER
+# ============================================================================
 def extract_resolution_tag(text: str, default_res: str = "HD") -> str:
     m = re.search(r"\b(360p|480p|540p|720p|1080p|1440p|2160p|4K)\b", text or "", re.I)
     if m:
@@ -144,14 +233,13 @@ def init_storage_db():
     conn.commit()
     conn.close()
 
-def is_already_in_any_channel(clean_title: str, ep_tag: str, res_tag: str = "") -> bool:
-    """Checks if this title + episode/movie + resolution already exists in ANY storage channel."""
+def is_already_in_any_channel(clean_title: str, ep_tag: str, res_tag: str = "ANY") -> bool:
     t_key = normalize_title_key(clean_title)
     e_key = ep_tag.upper().strip()
-    r_key = (res_tag or "").upper().strip()
+    r_key = (res_tag or "ANY").upper().strip()
 
     conn = sqlite3.connect("storage_index.db")
-    if r_key and r_key != "ANY":
+    if r_key != "ANY":
         row = conn.execute(
             "SELECT channel_id FROM indexed_files_v2 WHERE clean_title=? AND ep_tag=? AND res_tag=?",
             (t_key, e_key, r_key)
@@ -163,6 +251,16 @@ def is_already_in_any_channel(clean_title: str, ep_tag: str, res_tag: str = "") 
         ).fetchone()
     conn.close()
     return bool(row)
+
+def get_indexed_episodes_for_title(clean_title: str) -> set:
+    t_key = normalize_title_key(clean_title)
+    conn = sqlite3.connect("storage_index.db")
+    rows = conn.execute(
+        "SELECT DISTINCT ep_tag FROM indexed_files_v2 WHERE clean_title=?",
+        (t_key,)
+    ).fetchall()
+    conn.close()
+    return {r[0] for r in rows}
 
 def record_indexed_file(channel_id: int, clean_title: str, ep_tag: str, res_tag: str, file_name: str):
     conn = sqlite3.connect("storage_index.db")
@@ -179,22 +277,39 @@ def record_indexed_file(channel_id: int, clean_title: str, ep_tag: str, res_tag:
     conn.commit()
     conn.close()
 
+async def ensure_dialogs_cached():
+    """Warms up Telethon's entity cache once so PeerChannel(-100...) never fails."""
+    global DIALOG_CACHE_READY
+    if DIALOG_CACHE_READY:
+        return
+    try:
+        await client.get_dialogs(limit=100)
+        DIALOG_CACHE_READY = True
+    except Exception as e:
+        print(f"⚠️ Dialog cache warmup notice: {e}")
+
 async def sync_title_across_all_channels(query: str):
     """
-    Scans ALL storage channels on Telegram for existing posts of this title
-    so we never duplicate even after a server restart.
+    Safely scans relevant storage channels on Telegram for existing posts of this title
+    with pacing so it never triggers FloodWait.
     """
     clean_q = normalize_title_key(query)
     if not clean_q or clean_q == "unknown" or clean_q in SYNCED_TITLES:
         return
 
+    await ensure_dialogs_cached()
     SYNCED_TITLES.add(clean_q)
-    print(f"🔍 Scanning all {len(ALL_STORAGE_CHANNELS)} storage channels for existing '{clean_q}' files...")
-    found_count = 0
 
-    for ch_id in ALL_STORAGE_CHANNELS:
+    # Prioritize likely channels first to minimize RPC calls
+    meta = await fetch_meta(query)
+    primary_cat = detect_category(query, "", meta)
+    primary_ch = DEFAULT_CHANNELS.get(primary_cat, DEFAULT_CHANNELS["other"])
+    channels_to_scan = [primary_ch] + [c for c in ALL_STORAGE_CHANNELS if c != primary_ch]
+
+    found_count = 0
+    for ch_id in channels_to_scan:
         try:
-            async for msg in client.iter_messages(ch_id, search=clean_q, limit=80):
+            async for msg in client.iter_messages(ch_id, search=clean_q, limit=50):
                 if not (msg.video or msg.document or msg.text):
                     continue
                 fn = (msg.file.name if msg.file else "") or ""
@@ -205,18 +320,106 @@ async def sync_title_across_all_channels(query: str):
 
                 ep_tag = extract_season_ep_tag(txt, "S01")
                 res_tag = extract_resolution_tag(txt, "HD")
-                record_indexed_file(ch_id, clean_q, ep_tag, res_tag, fn or "existing_channel_post")
+                record_indexed_file(ch_id, clean_q, ep_tag, res_tag, fn or "existing_post")
                 found_count += 1
+            await asyncio.sleep(0.25)
+        except FloodWaitError as fw:
+            await asyncio.sleep(fw.seconds + 1)
         except Exception:
             pass
 
     if found_count:
-        print(f"✅ Synced {found_count} existing files for '{clean_q}' across storage channels.")
+        print(f"✅ Synced {found_count} existing files for '{clean_q}' from storage channels.")
 
 init_storage_db()
 
 # ============================================================================
-# 3. ADVANCED TECHNICAL SPEC PARSER & CAPTION BUILDER
+# 4. OFFICIAL CATALOG & FRANCHISE RESOLVER (TVMAZE + TMDB + IMDB)
+# ============================================================================
+async def fetch_official_catalog(title: str) -> dict:
+    """
+    Queries TVMaze (free, no key needed), TMDB, and IMDb Suggestion API
+    to discover total seasons/episodes or movie franchise sequels.
+    """
+    clean = normalize_title_key(title)
+    seasons_map = {}      # {1: [1, 2, ...], 2: [1, 2, ...]}
+    franchise_movies = [] # ["John Wick", "John Wick Chapter 2", ...]
+
+    async with aiohttp.ClientSession() as session:
+        # 1. TVMaze Episode Guide (100% Free, No Key Required, Accurate Episode Lists)
+        try:
+            url = f"https://api.tvmaze.com/singlesearch/shows?q={quote_plus(clean)}&embed=episodes"
+            async with session.get(url, timeout=5) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    eps = data.get("_embedded", {}).get("episodes", [])
+                    for ep in eps:
+                        s_num = ep.get("season")
+                        e_num = ep.get("number")
+                        if s_num and e_num:
+                            seasons_map.setdefault(int(s_num), []).append(int(e_num))
+        except Exception:
+            pass
+
+        # 2. TMDB Series / Movie Collection Lookup (if TMDB_API_KEY is configured)
+        if TMDB_API_KEY:
+            try:
+                s_url = f"https://api.themoviedb.org/3/search/multi?api_key={TMDB_API_KEY}&query={quote_plus(clean)}"
+                async with session.get(s_url, timeout=4) as r:
+                    if r.status == 200:
+                        res_list = (await r.json()).get("results") or []
+                        if res_list and res_list[0].get("media_type") == "tv" and not seasons_map:
+                            tv_id = res_list[0]["id"]
+                            tv_url = f"https://api.themoviedb.org/3/tv/{tv_id}?api_key={TMDB_API_KEY}"
+                            async with session.get(tv_url, timeout=4) as tr:
+                                if tr.status == 200:
+                                    tv_data = await tr.json()
+                                    for s_info in tv_data.get("seasons", []):
+                                        sn = s_info.get("season_number", 0)
+                                        ec = s_info.get("episode_count", 0)
+                                        if sn > 0 and ec > 0:
+                                            seasons_map[sn] = list(range(1, ec + 1))
+
+                # Also check TMDB Movie Collections for Movie Franchises
+                c_url = f"https://api.themoviedb.org/3/search/collection?api_key={TMDB_API_KEY}&query={quote_plus(clean)}"
+                async with session.get(c_url, timeout=4) as cr:
+                    if cr.status == 200:
+                        c_results = (await cr.json()).get("results") or []
+                        if c_results:
+                            col_id = c_results[0]["id"]
+                            col_url = f"https://api.themoviedb.org/3/collection/{col_id}?api_key={TMDB_API_KEY}"
+                            async with session.get(col_url, timeout=4) as d_resp:
+                                if d_resp.status == 200:
+                                    parts = (await d_resp.json()).get("parts") or []
+                                    for p in parts:
+                                        if p.get("title"):
+                                            franchise_movies.append(p["title"])
+            except Exception:
+                pass
+
+        # 3. IMDb Free Public API Fallback for Movie Franchises
+        if not seasons_map and not franchise_movies:
+            try:
+                first_char = clean[0] if clean else "a"
+                imdb_url = f"https://v3.sg.media-imdb.com/suggestion/{first_char}/{quote_plus(clean)}.json"
+                async with session.get(imdb_url, timeout=4) as ir:
+                    if ir.status == 200:
+                        idata = await ir.json()
+                        for item in idata.get("d", []):
+                            lbl = item.get("l", "")
+                            q_type = (item.get("q") or "").lower()
+                            if clean in normalize_title_key(lbl) and ("feature" in q_type or "movie" in q_type):
+                                franchise_movies.append(lbl)
+            except Exception:
+                pass
+
+    return {
+        "seasons": seasons_map,
+        "franchise_movies": franchise_movies[:10]
+    }
+
+# ============================================================================
+# 5. TECHNICAL SPEC PARSER & CAPTION BUILDER
 # ============================================================================
 def format_size_human(size_bytes: int) -> str:
     if not size_bytes:
@@ -238,10 +441,8 @@ def extract_real_filename(filename="", caption=""):
 def extract_tech_specs(filename="", caption="", file_size_bytes=0):
     real_fn = extract_real_filename(filename, caption)
     combined = f"{real_fn}\n{caption or ''}"
-
     qual = extract_resolution_tag(combined, ACTIVE_RES_TAG or "1080P")
 
-    # Source / Rip Type
     source = ""
     for pat, label in [
         (r"\b(?:bluray|bdrip|brrip|bd)\b", "BluRay"),
@@ -255,7 +456,6 @@ def extract_tech_specs(filename="", caption="", file_size_bytes=0):
             source = label
             break
 
-    # Video Codec & Bit Depth
     codec = "x264"
     if re.search(r"\b(x265|h265|hevc)\b", combined, re.I):
         codec = "HEVC x265"
@@ -264,14 +464,11 @@ def extract_tech_specs(filename="", caption="", file_size_bytes=0):
     if re.search(r"\b10\s*-?bit\b", combined, re.I) and "10-Bit" not in codec:
         codec += " 10-Bit"
 
-    # Audio codec detection
     aud_codec = "AAC 2.0"
     if re.search(r"\bddp\s*5\.1\b", combined, re.I):
         aud_codec = "DDP 5.1"
     elif re.search(r"\bddp\s*2\.0\b", combined, re.I):
         aud_codec = "DDP 2.0"
-    elif re.search(r"\bac3\b", combined, re.I):
-        aud_codec = "AC3"
 
     br_m = re.search(r"Video\s*Bitrate\s*:\s*([^\r\n]+)", combined, re.I) or re.search(r"\b(\d{3,5}\s*kbps)\b", combined, re.I)
     bitrate = br_m.group(1).strip() if br_m else ""
@@ -282,7 +479,6 @@ def extract_tech_specs(filename="", caption="", file_size_bytes=0):
     for_tv = bool(re.search(r"Can\s*be\s*played\s*on\s*TV|FOR\s*TV", combined, re.I) or "x264" in codec)
     has_sub = bool(re.search(r"Has\s*[a-zA-Z]*\s*subtitles|\b(?:sub|subs|esub|multisub|mmsub)\b|\.mkv\b", combined, re.I))
 
-    # Extract each language on its own bullet line (like in your screenshot!)
     audio_lines = []
     aud_section = re.search(r"Audio\s*List\s*:\s*((?:\r?\n\s*\*[^\r\n]+)+)", caption or "", re.I)
     if aud_section:
@@ -312,7 +508,6 @@ def extract_tech_specs(filename="", caption="", file_size_bytes=0):
         else:
             audio_lines = [f"* {aud_codec} — Original Audio"]
 
-    # Determine Dual / Multi Audio badge
     audio_mode = ""
     if len(detected_langs) >= 3 or re.search(r"\bmulti\s*audio\b", combined, re.I):
         audio_mode = f"Multi Audio ({', '.join(detected_langs[:4])})" if detected_langs else "Multi Audio"
@@ -380,7 +575,7 @@ def build_final_caption(filename, caption, meta_runtime="", file_size_bytes=0):
     return "\n".join(lines)
 
 # ============================================================================
-# 4. METADATA RESOLVER & CATEGORIZATION
+# 6. METADATA & CATEGORY ENGINE + GREEN INLINE BUTTON PUBLISHER
 # ============================================================================
 async def fetch_meta(title):
     clean = normalize_title_key(title)
@@ -393,7 +588,7 @@ async def fetch_meta(title):
     async with aiohttp.ClientSession() as session:
         if TMDB_API_KEY:
             try:
-                url = f"https://api.themoviedb.org/3/search/multi?api_key={TMDB_API_KEY}&query={clean}"
+                url = f"https://api.themoviedb.org/3/search/multi?api_key={TMDB_API_KEY}&query={quote_plus(clean)}"
                 async with session.get(url, timeout=3) as r:
                     if r.status == 200:
                         data = await r.json()
@@ -406,7 +601,7 @@ async def fetch_meta(title):
 
         if OMDB_API_KEY:
             try:
-                url = f"https://www.omdbapi.com/?apikey={OMDB_API_KEY}&t={clean}"
+                url = f"https://www.omdbapi.com/?apikey={OMDB_API_KEY}&t={quote_plus(clean)}"
                 async with session.get(url, timeout=3) as r:
                     if r.status == 200:
                         data = await r.json()
@@ -426,7 +621,7 @@ def detect_category(filename, caption, meta):
     combined = f"{filename} {caption} {meta.get('genres', '')}".lower()
     lang = (meta.get("language") or "").lower()
 
-    if re.search(r"\b(anime|demon slayer|solo leveling|jujutsu|naruto|one piece|bleach|attack on titan|kimetsu)\b", combined) or (
+    if re.search(r"\b(anime|demon slayer|solo leveling|jujutsu|naruto|one piece|bleach|attack on titan|kimetsu|blue lock)\b", combined) or (
         "animation" in meta.get("genres", "").lower() and lang in ("ja", "zh")
     ):
         return "anime"
@@ -457,15 +652,8 @@ def detect_category(filename, caption, meta):
 
     return "english"
 
-# ============================================================================
-# 5. EXACT GREEN INLINE BUTTON PUBLISHER (USERBOT + BOT API HYBRID)
-# ============================================================================
 async def publish_file_with_green_buttons(dest_channel: int, media, final_caption: str):
-    """
-    1. Userbot sends the file (even 2GB+) to dest_channel (bypasses 50MB Bot API upload limit).
-    2. If BOT_TOKEN is set, Bot API copies the message in-place with 'style': 'success' (Green)
-       inline buttons [Series] [Anime] [Movies] and deletes the temporary userbot message.
-    """
+    await ensure_dialogs_cached()
     sent_msg = await client.send_file(
         dest_channel,
         file=media,
@@ -491,17 +679,16 @@ async def publish_file_with_green_buttons(dest_channel: int, media, final_captio
             async with session.post(api_url, data=payload, timeout=10) as resp:
                 data = await resp.json()
                 if data.get("ok"):
-                    # Delete the temporary un-buttoned userbot message
                     await client.delete_messages(dest_channel, [sent_msg.id])
                 else:
                     print(f"⚠️ Bot API copyMessage notice: {data.get('description')}")
     except Exception as e:
-        print(f"⚠️ Green button attach notice (file still published): {e}")
+        print(f"⚠️ Green button attach notice: {e}")
 
     return sent_msg
 
 # ============================================================================
-# 6. SMART BUTTON SCORING & MULTI-RESOLUTION GROUPING
+# 7. BUTTON SCORING & NAVIGATION HELPERS
 # ============================================================================
 def select_best_title_button(buttons, query: str):
     clean_q = normalize_title_key(query)
@@ -554,10 +741,6 @@ def score_quality_button(text: str) -> int:
     return score
 
 def collect_resolution_quality_buttons(buttons):
-    """
-    Groups quality buttons by resolution (360P, 480P, 720P, 1080P, 2160P)
-    and picks the highest-scored option (preferring Dual/Multi-Audio & BluRay/HEVC) for EACH resolution.
-    """
     res_map = {}
     for row in buttons:
         for btn in row:
@@ -590,23 +773,17 @@ def parse_size_mb(text: str) -> float:
         return val / 1024.0
     return val
 
-# ============================================================================
-# 7. AUTO-JOIN CHANNELS & NON-HANGING CLICK HELPERS
-# ============================================================================
 async def auto_join_channel(url: str):
     try:
         if "+" in url or "joinchat" in url:
             invite_hash = url.split("+")[-1].split("/")[-1].strip()
             await client(ImportChatInviteRequest(invite_hash))
-            print(f"✅ Joined private channel: {url}")
         else:
             uname = url.split("t.me/")[-1].split("/")[0].split("?")[0].strip()
             if uname:
                 await client(JoinChannelRequest(uname))
-                print(f"✅ Joined public channel: @{uname}")
         return True
-    except Exception as e:
-        print(f"⚠️ Channel join: {e}")
+    except Exception:
         return False
 
 async def trigger_start_url(url: str) -> bool:
@@ -616,7 +793,6 @@ async def trigger_start_url(url: str) -> bool:
     target_bot = parsed.path.strip("/") or SOURCE_BOT
     start_param = parse_qs(parsed.query).get("start", [""])[0]
     if target_bot and start_param:
-        print(f"🔗 Following callback deep-link: @{target_bot} -> /start {start_param}")
         await client.send_message(target_bot, f"/start {start_param}")
         return True
     return False
@@ -635,7 +811,6 @@ async def smart_click_button(btn):
     except asyncio.TimeoutError:
         pass
     except FloodWaitError as fw:
-        print(f"⏳ FloodWait during click: sleeping {fw.seconds}s...")
         await asyncio.sleep(fw.seconds + 1)
     except Exception as e:
         print(f"⚠️ Button click notice: {e}")
@@ -673,7 +848,6 @@ async def wait_for_menu_update(bot_entity, tracked_msg_id, old_sig: str, max_wai
     return await find_latest_menu_message(bot_entity, tracked_msg_id)
 
 def is_file_or_episode_grid(msg) -> bool:
-    """Detects both Series Episode Grids (E01, E02) and Movie File Grids ([450 MB], [1.4 GB], .mkv)."""
     if not msg or not msg.buttons:
         return False
     text = (msg.text or "").lower()
@@ -689,7 +863,7 @@ def is_file_or_episode_grid(msg) -> bool:
     return False
 
 # ============================================================================
-# 8. INCOMING MEDIA EVENT (INTERCEPT, CROSS-CHANNEL CHECK, FORWARD & UNBLOCK)
+# 8. INCOMING MEDIA EVENT
 # ============================================================================
 @client.on(events.NewMessage(incoming=True))
 async def on_media_arrival(event):
@@ -726,9 +900,8 @@ async def on_media_arrival(event):
     res_tag = extract_resolution_tag(combined_text, ACTIVE_RES_TAG or "1080P")
     title_key = ACTIVE_CLEAN_TITLE or meta["title"]
 
-    # Check across ALL storage channels before uploading
     if is_already_in_any_channel(title_key, ep_tag, res_tag):
-        print(f"⏭️ Duplicate detected across storage channels ({title_key} • {ep_tag} • {res_tag}) — cancelling upload & continuing.")
+        print(f"⏭️ Duplicate detected ({title_key} • {ep_tag} • {res_tag}) — skipping.")
         FILE_COMPLETED_EVENT.set()
         return
 
@@ -736,7 +909,7 @@ async def on_media_arrival(event):
 
     try:
         await publish_file_with_green_buttons(dest_channel, msg.media, final_caption)
-        print(f"🚀 Published {title_key.title()} [{ep_tag} • {res_tag}] to {cat_emoji} {cat.upper()} ({dest_channel})")
+        print(f"🚀 Published {title_key.title()} [{ep_tag} • {res_tag}] to {cat_emoji} {cat.upper()}")
 
         record_indexed_file(dest_channel, title_key, ep_tag, res_tag, raw_fn)
 
@@ -746,11 +919,10 @@ async def on_media_arrival(event):
             f"• <b>Title:</b> <code>{title_key.title()} ({ep_tag} • {res_tag})</code>\n"
             f"• <b>File:</b> <code>{extract_real_filename(raw_fn, caption)}</code>\n"
             f"• <b>Size:</b> <code>{format_size_human(file_size)}</code>\n"
-            f"• <b>Channel:</b> {cat_emoji} <code>{cat.upper()}</code> ➔ <code>{dest_channel}</code>",
+            f"• <b>Channel:</b> {cat_emoji} <code>{cat.upper()}</code>",
             parse_mode="HTML"
         )
     except FloodWaitError as fw:
-        print(f"⏳ FloodWait on upload: sleeping {fw.seconds}s...")
         await asyncio.sleep(fw.seconds + 1)
     except Exception as e:
         print(f"❌ Storage Forward error: {e}")
@@ -758,15 +930,11 @@ async def on_media_arrival(event):
         FILE_COMPLETED_EVENT.set()
 
 # ============================================================================
-# 9. MULTI-RESOLUTION & MULTI-SEASON STATE NAVIGATOR
+# 9. NAVIGATOR & SELECTIVE/MISSING EPISODE DOWNLOADER
 # ============================================================================
 async def navigate_to_grid(query: str, target_season_num: int = 1, target_res: str = None, send_fresh: bool = True):
-    """
-    Navigates: Title ➔ Season (target_season_num) ➔ Quality (target_res or discovers all resolutions)
-    Returns: (grid_msg, available_seasons, available_resolutions)
-    """
     if send_fresh:
-        print(f"📨 Sending search query to @{SOURCE_BOT}: '{query}' (Season {target_season_num:02d} • Res: {target_res or 'AUTO'})")
+        print(f"📨 Querying @{SOURCE_BOT}: '{query}' (Season {target_season_num:02d} • Res: {target_res or 'AUTO'})")
         await client.send_message(SOURCE_BOT, query)
         await asyncio.sleep(2.0)
 
@@ -775,6 +943,8 @@ async def navigate_to_grid(query: str, target_season_num: int = 1, target_res: s
     available_resolutions = []
 
     for _ in range(16):
+        if SKIP_CURRENT_TITLE:
+            break
         msg = await find_latest_menu_message(SOURCE_BOT, tracked_menu_id)
         if not msg or not msg.buttons:
             await asyncio.sleep(1.0)
@@ -784,7 +954,7 @@ async def navigate_to_grid(query: str, target_season_num: int = 1, target_res: s
         text = (msg.text or "").lower()
         old_sig = get_menu_signature(msg)
 
-        # 1. Bypass Force-Subscribe (FSUB) if prompted
+        # 1. FSUB Bypass
         joined = False
         for row in msg.buttons:
             for btn in row:
@@ -804,11 +974,11 @@ async def navigate_to_grid(query: str, target_season_num: int = 1, target_res: s
                         break
             continue
 
-        # 2. Screen D: File / Episode Grid Reached
+        # 2. Episode / File Grid Reached
         if is_file_or_episode_grid(msg):
             return msg, available_seasons, available_resolutions
 
-        # 3. Screen A: Title Selection
+        # 3. Title Selection
         if "choose the correct title" in text or "matching results" in text or "search results for" in text:
             best_title_btn = select_best_title_button(msg.buttons, query)
             print(f"👉 [Screen 1/Title] Clicking: {best_title_btn.text}")
@@ -816,7 +986,7 @@ async def navigate_to_grid(query: str, target_season_num: int = 1, target_res: s
             await wait_for_menu_update(SOURCE_BOT, tracked_menu_id, old_sig)
             continue
 
-        # 4. Screen B: Season Selection
+        # 4. Season Selection
         if "choose the season" in text or any("season" in (b.text or "").lower() for r in msg.buttons for b in r):
             season_btns = {}
             fallback_btn = None
@@ -828,8 +998,7 @@ async def navigate_to_grid(query: str, target_season_num: int = 1, target_res: s
                         continue
                     m = re.search(r"season\s*0*(\d+)", low)
                     if m:
-                        s_num = int(m.group(1))
-                        season_btns[s_num] = btn
+                        season_btns[int(m.group(1))] = btn
                     elif "season all" in low:
                         fallback_btn = btn
 
@@ -840,20 +1009,19 @@ async def navigate_to_grid(query: str, target_season_num: int = 1, target_res: s
             await wait_for_menu_update(SOURCE_BOT, tracked_menu_id, old_sig)
             continue
 
-        # 5. Screen C: Quality / Resolution Selection
+        # 5. Quality Selection
         if "select the available quality" in text or "quality" in text:
             res_options = collect_resolution_quality_buttons(msg.buttons)
             available_resolutions = [r[0] for r in res_options]
 
             chosen_qual_btn = None
             if target_res:
-                for r_tag, r_label, r_btn in res_options:
+                for r_tag, _, r_btn in res_options:
                     if r_tag == target_res:
                         chosen_qual_btn = r_btn
                         break
 
             if not chosen_qual_btn and res_options:
-                # Default to highest or first available resolution option
                 chosen_qual_btn = res_options[0][2]
 
             if chosen_qual_btn:
@@ -862,26 +1030,34 @@ async def navigate_to_grid(query: str, target_season_num: int = 1, target_res: s
                 await wait_for_menu_update(SOURCE_BOT, tracked_menu_id, old_sig)
                 continue
             else:
-                print("❌ No valid quality buttons found.")
                 break
 
         await asyncio.sleep(1.0)
 
     return None, available_seasons, available_resolutions
 
-# ============================================================================
-# 10. UNSTOPPABLE EPISODE & MOVIE DOWNLOADER (ALL RESOLUTIONS)
-# ============================================================================
-async def download_from_grid(initial_msg, query: str, season_num: int, active_res: str):
+async def download_from_grid(
+    initial_msg,
+    query: str,
+    season_num: int,
+    active_res: str,
+    target_episodes: set = None,
+    only_missing: bool = False
+):
+    """
+    Downloads episodes/movies from the grid.
+    - If target_episodes is set (e.g. {4, 5, 7}), ONLY downloads those episode numbers!
+    - If only_missing is True, skips any episode that already exists in ANY resolution in storage.
+    """
     global ACTIVE_SEASON_TAG, ACTIVE_EP_TAG, ACTIVE_RES_TAG
     ACTIVE_SEASON_TAG = f"S{season_num:02d}"
     ACTIVE_RES_TAG = active_res or "1080P"
     menu_msg_id = initial_msg.id
     current_msg = initial_msg
     current_page = 1
+    remaining_targets = set(target_episodes) if target_episodes else None
 
-    while True:
-        # Group buttons by (ep_or_movie_tag, resolution_tag)
+    while not SKIP_CURRENT_TITLE:
         best_item_map = {}
         item_counts = {}
         item_order = []
@@ -898,14 +1074,20 @@ async def download_from_grid(initial_msg, query: str, season_num: int, active_re
                     continue
 
                 ep_m = re.search(r"\b(?:E|EP\.?)0*(\d{1,3})\b", txt, re.I)
-                if ep_m:
-                    ep_tag = f"{ACTIVE_SEASON_TAG}E{int(ep_m.group(1)):02d}"
+                ep_num = int(ep_m.group(1)) if ep_m else None
+                if ep_num is not None:
+                    # Filter by user's requested episode range/list if specified
+                    if remaining_targets is not None and ep_num not in remaining_targets:
+                        continue
+                    ep_tag = f"{ACTIVE_SEASON_TAG}E{ep_num:02d}"
                 else:
+                    if remaining_targets is not None:
+                        continue
                     ep_tag = "MOVIE"
 
                 btn_res = extract_resolution_tag(txt, ACTIVE_RES_TAG)
                 size_mb = parse_size_mb(txt)
-                item_key = (ep_tag, btn_res)
+                item_key = (ep_tag, btn_res, ep_num)
 
                 item_counts[item_key] = item_counts.get(item_key, 0) + 1
                 if item_key not in best_item_map:
@@ -915,24 +1097,25 @@ async def download_from_grid(initial_msg, query: str, season_num: int, active_re
                     if size_mb > best_item_map[item_key][0]:
                         best_item_map[item_key] = (size_mb, btn)
 
-        # Page-Boundary Split Protection for Series Episodes
-        if next_button and len(item_order) >= 2:
+        # Page-Boundary Split Protection
+        if next_button and len(item_order) >= 2 and remaining_targets is None:
             last_key = item_order[-1]
             last_size = best_item_map[last_key][0]
             prev_sizes = [best_item_map[k][0] for k in item_order[:-1] if best_item_map[k][0] > 0]
             avg_prev = (sum(prev_sizes) / len(prev_sizes)) if prev_sizes else 0
             if item_counts.get(last_key, 0) == 1 and avg_prev > 0 and last_size < (avg_prev * 0.55):
-                print(f"💡 Deferring {last_key[0]} ({last_size:.0f} MB) to next page for full BluRay size.")
                 item_order.pop()
 
-        print(f"📋 [{ACTIVE_SEASON_TAG} • {ACTIVE_RES_TAG} • Page {current_page}] Found {len(item_order)} items.")
+        for ep_tag, btn_res, ep_num in item_order:
+            if SKIP_CURRENT_TITLE:
+                break
+            _, btn = best_item_map[(ep_tag, btn_res, ep_num)]
 
-        for ep_tag, btn_res in item_order:
-            _, btn = best_item_map[(ep_tag, btn_res)]
-
-            # Check across ALL storage channels before clicking
-            if is_already_in_any_channel(ACTIVE_CLEAN_TITLE, ep_tag, btn_res):
-                print(f"⏭️ Skipping {ACTIVE_CLEAN_TITLE} [{ep_tag} • {btn_res}] — already in storage channels.")
+            check_res = "ANY" if only_missing else btn_res
+            if is_already_in_any_channel(ACTIVE_CLEAN_TITLE, ep_tag, check_res):
+                print(f"⏭️ Skipping {ACTIVE_CLEAN_TITLE} [{ep_tag} • {btn_res}] — already in storage.")
+                if remaining_targets is not None and ep_num in remaining_targets:
+                    remaining_targets.discard(ep_num)
                 continue
 
             ACTIVE_EP_TAG = ep_tag
@@ -944,16 +1127,15 @@ async def download_from_grid(initial_msg, query: str, season_num: int, active_re
 
             try:
                 await asyncio.wait_for(FILE_COMPLETED_EVENT.wait(), timeout=90)
-                print(f"✅ Completed {ep_tag} ({btn_res}).")
+                if remaining_targets is not None and ep_num in remaining_targets:
+                    remaining_targets.discard(ep_num)
             except asyncio.TimeoutError:
-                print(f"⚠️ Timeout on {ep_tag} ({btn_res}) — continuing automatically...")
+                print(f"⚠️ Timeout on {ep_tag} ({btn_res}) — continuing...")
 
             await asyncio.sleep(1.5)
 
-            # Auto-Recovery: If menu message expired or disappeared, re-send title & return to exact page
             check_msg = await client.get_messages(SOURCE_BOT, ids=menu_msg_id)
             if not check_msg or not check_msg.buttons:
-                print(f"🔄 Menu expired! Re-sending '{query}' to recover {ACTIVE_SEASON_TAG} ({ACTIVE_RES_TAG}) Page {current_page}...")
                 recovered_msg, _, _ = await navigate_to_grid(query, season_num, active_res, send_fresh=True)
                 if recovered_msg:
                     menu_msg_id = recovered_msg.id
@@ -965,7 +1147,11 @@ async def download_from_grid(initial_msg, query: str, season_num: int, active_re
                             await smart_click_button(nxt)
                             current_msg = await wait_for_menu_update(SOURCE_BOT, menu_msg_id, old_s)
 
-        # Refresh menu before checking Next Page
+        # Stop immediately if all specifically requested episodes on this season were downloaded
+        if remaining_targets is not None and len(remaining_targets) == 0:
+            print(f"🎯 All requested target episodes for {ACTIVE_SEASON_TAG} completed!")
+            break
+
         refreshed = await client.get_messages(SOURCE_BOT, ids=menu_msg_id)
         if refreshed and refreshed.buttons:
             current_msg = refreshed
@@ -973,7 +1159,6 @@ async def download_from_grid(initial_msg, query: str, season_num: int, active_re
 
         if next_button:
             current_page += 1
-            print(f"📄 Clicking Next ⏩ to Page {current_page}...")
             old_sig = get_menu_signature(current_msg)
             await smart_click_button(next_button)
             current_msg = await wait_for_menu_update(SOURCE_BOT, menu_msg_id, old_sig)
@@ -983,115 +1168,278 @@ async def download_from_grid(initial_msg, query: str, season_num: int, active_re
             break
 
 # ============================================================================
-# 11. MASTER PIPELINE & UNSTOPPABLE QUEUE WORKER
+# 10. MASTER UNSTOPPABLE QUEUE WORKER & MISSING-FILES AUDITOR
 # ============================================================================
+async def execute_missing_audit_and_fill(cmd: dict):
+    """
+    1. Queries IMDb / TVMaze / TMDB for official episodes or movie franchise parts.
+    2. Scans storage channels.
+    3. Reports and downloads ONLY the missing episodes or missing franchise movies.
+    """
+    title = cmd["title"]
+    clean_t = normalize_title_key(title)
+    await sync_title_across_all_channels(title)
+
+    catalog = await fetch_official_catalog(title)
+    existing_eps = get_indexed_episodes_for_title(clean_t)
+
+    # Case A: Movie Franchise (multiple parts/sequels)
+    if not catalog["seasons"] and len(catalog["franchise_movies"]) > 1:
+        missing_movies = []
+        for m_title in catalog["franchise_movies"]:
+            await sync_title_across_all_channels(m_title)
+            if not is_already_in_any_channel(m_title, "MOVIE", "ANY"):
+                missing_movies.append(m_title)
+
+        await client.send_message(
+            "me",
+            f"🔎 <b>Franchise Audit:</b> <code>{title.title()}</code>\n"
+            f"• <b>Total Parts Found (IMDb/TMDB):</b> <code>{len(catalog['franchise_movies'])}</code>\n"
+            f"• <b>Missing Parts ({len(missing_movies)}):</b> <code>{', '.join(missing_movies) or 'None! All present.'}</code>",
+            parse_mode="HTML"
+        )
+        for m_title in missing_movies:
+            TITLE_QUEUE.appendleft(({"raw": m_title, "title": m_title, "mode": "normal", "season": None, "episodes": None}, True))
+        return
+
+    # Case B: Series / Anime Missing Episodes
+    missing_by_season = {}
+    if catalog["seasons"]:
+        for s_num, ep_list in sorted(catalog["seasons"].items()):
+            if cmd["season"] and s_num != cmd["season"]:
+                continue
+            for e_num in ep_list:
+                tag = f"S{s_num:02d}E{e_num:02d}"
+                if tag not in existing_eps:
+                    missing_by_season.setdefault(s_num, set()).add(e_num)
+
+    if missing_by_season:
+        summary = ", ".join(
+            f"S{s:02d} ({len(eps)} missing: E{min(eps):02d}-E{max(eps):02d})"
+            for s, eps in sorted(missing_by_season.items())
+        )
+        await client.send_message(
+            "me",
+            f"🔎 <b>Missing Files Audit (IMDb/TVMaze/TMDB):</b> <code>{title.title()}</code>\n"
+            f"• <b>Already in Storage:</b> <code>{len(existing_eps)}</code> episodes\n"
+            f"• <b>Missing Detected:</b> <code>{summary}</code>\n"
+            f"⚡ <i>Filling missing episodes now...</i>",
+            parse_mode="HTML"
+        )
+        for s_num, miss_eps in sorted(missing_by_season.items()):
+            if SKIP_CURRENT_TITLE:
+                break
+            grid_msg, _, _ = await navigate_to_grid(title, s_num, target_res=None, send_fresh=True)
+            if grid_msg:
+                await download_from_grid(grid_msg, title, s_num, "1080P", target_episodes=miss_eps, only_missing=True)
+    else:
+        # Fallback: Even if external catalog didn't list episodes, scan bot directly and fill any un-indexed episodes
+        await client.send_message(
+            "me",
+            f"🔎 <b>Scanning @{SOURCE_BOT} directly for any missing episodes of:</b> <code>{title.title()}</code>\n"
+            f"• <b>Currently in Storage:</b> <code>{len(existing_eps)}</code> episodes",
+            parse_mode="HTML"
+        )
+        grid_msg, all_seasons, _ = await navigate_to_grid(title, cmd["season"] or 1, target_res=None, send_fresh=True)
+        if grid_msg:
+            seasons = [cmd["season"]] if cmd["season"] else (all_seasons or [1])
+            await download_from_grid(grid_msg, title, seasons[0], "1080P", only_missing=True)
+            for nxt_s in seasons[1:]:
+                s_grid, _, _ = await navigate_to_grid(title, nxt_s, target_res=None, send_fresh=True)
+                if s_grid:
+                    await download_from_grid(s_grid, title, nxt_s, "1080P", only_missing=True)
+
 async def process_queue():
-    global CURRENT_PIPELINE_ACTIVE, ACTIVE_CLEAN_TITLE, ACTIVE_EP_TAG, ACTIVE_RES_TAG
+    global CURRENT_PIPELINE_ACTIVE, ACTIVE_CLEAN_TITLE, ACTIVE_EP_TAG, ACTIVE_RES_TAG, SKIP_CURRENT_TITLE
     if CURRENT_PIPELINE_ACTIVE:
         return
 
     CURRENT_PIPELINE_ACTIVE = True
     try:
         while TITLE_QUEUE:
-            query, send_initial = TITLE_QUEUE.popleft()
-            ACTIVE_CLEAN_TITLE = normalize_title_key(query)
-            ACTIVE_EP_TAG = ""
-            ACTIVE_RES_TAG = ""
+            # Isolated try/except per item so one failure NEVER stops the rest of the queue
+            try:
+                SKIP_CURRENT_TITLE = False
+                cmd, send_initial = TITLE_QUEUE.popleft()
+                if isinstance(cmd, str):
+                    cmd = parse_smart_user_command(cmd)
 
-            # Step 1: Scan all Telegram storage channels for existing files of this title
-            await sync_title_across_all_channels(query)
+                query = cmd["title"]
+                ACTIVE_CLEAN_TITLE = normalize_title_key(query)
+                ACTIVE_EP_TAG = ""
+                ACTIVE_RES_TAG = ""
 
-            explicit_s = re.search(r"\b(?:S|Season\s*)0*(\d{1,2})\b", query, re.I)
-            start_season = int(explicit_s.group(1)) if explicit_s else 1
+                print(f"🎬 Processing: '{query}' | Mode: {cmd['mode']} | Season: {cmd['season']} | Eps: {cmd['episodes']}")
 
-            # Step 2: Initial navigation to discover seasons and available resolutions (360p, 480p, 720p, 1080p)
-            grid_msg, all_seasons, all_resolutions = await navigate_to_grid(
-                query, start_season, target_res=None, send_fresh=send_initial
-            )
-            if not grid_msg:
-                print(f"❌ Could not reach file grid for: {query}. Moving to next in queue.")
-                continue
-
-            seasons_to_run = [start_season] if explicit_s else (all_seasons if all_seasons else [start_season])
-            resolutions_to_run = all_resolutions if all_resolutions else ["1080P"]
-
-            # Step 3: Process first discovered grid immediately
-            first_season = seasons_to_run[0]
-            first_res = resolutions_to_run[0]
-            await download_from_grid(grid_msg, query, first_season, first_res)
-
-            # Step 4: Loop through remaining resolutions (360p, 480p, 720p, 1080p) for first season
-            for res_tag in resolutions_to_run[1:]:
-                print(f"🎞️ Switching to resolution {res_tag} for '{query}' (Season {first_season:02d})...")
-                await asyncio.sleep(1.5)
-                res_grid, _, _ = await navigate_to_grid(query, first_season, target_res=res_tag, send_fresh=True)
-                if res_grid:
-                    await download_from_grid(res_grid, query, first_season, res_tag)
-
-            # Step 5: Loop through remaining Seasons (Season 02, Season 03...) and their resolutions
-            for next_s in seasons_to_run[1:]:
-                if next_s <= first_season:
+                if cmd["mode"] == "missing":
+                    await execute_missing_audit_and_fill(cmd)
                     continue
-                print(f"🔁 Starting Season {next_s:02d} for '{query}'...")
+
+                await sync_title_across_all_channels(query)
+                if SKIP_CURRENT_TITLE:
+                    continue
+
+                start_season = cmd["season"] or 1
+                target_eps = set(cmd["episodes"]) if cmd["episodes"] else None
+
+                grid_msg, all_seasons, all_resolutions = await navigate_to_grid(
+                    query, start_season, target_res=None, send_fresh=send_initial
+                )
+                if not grid_msg or SKIP_CURRENT_TITLE:
+                    print(f"⚠️ Could not reach file grid for '{query}', continuing to next item...")
+                    continue
+
+                # If specific episodes were requested (e.g., "from S2 ep 4 - 5 ep 7"), grab them fast!
+                if target_eps:
+                    first_res = all_resolutions[0] if all_resolutions else "1080P"
+                    await download_from_grid(
+                        grid_msg, query, start_season, first_res, target_episodes=target_eps
+                    )
+                else:
+                    seasons_to_run = [start_season] if cmd["season"] else (all_seasons if all_seasons else [start_season])
+                    resolutions_to_run = all_resolutions if all_resolutions else ["1080P"]
+
+                    first_season = seasons_to_run[0]
+                    first_res = resolutions_to_run[0]
+                    await download_from_grid(grid_msg, query, first_season, first_res)
+
+                    for res_tag in resolutions_to_run[1:]:
+                        if SKIP_CURRENT_TITLE:
+                            break
+                        await asyncio.sleep(1.5)
+                        res_grid, _, _ = await navigate_to_grid(query, first_season, target_res=res_tag, send_fresh=True)
+                        if res_grid and not SKIP_CURRENT_TITLE:
+                            await download_from_grid(res_grid, query, first_season, res_tag)
+
+                    for next_s in seasons_to_run[1:]:
+                        if SKIP_CURRENT_TITLE or next_s <= first_season:
+                            continue
+                        await asyncio.sleep(2.0)
+                        s_grid, _, s_res_list = await navigate_to_grid(query, next_s, target_res=None, send_fresh=True)
+                        if not s_grid or SKIP_CURRENT_TITLE:
+                            continue
+                        s_resolutions = s_res_list if s_res_list else ["1080P"]
+                        await download_from_grid(s_grid, query, next_s, s_resolutions[0])
+
+                        for res_tag in s_resolutions[1:]:
+                            if SKIP_CURRENT_TITLE:
+                                break
+                            await asyncio.sleep(1.5)
+                            r_grid, _, _ = await navigate_to_grid(query, next_s, target_res=res_tag, send_fresh=True)
+                            if r_grid and not SKIP_CURRENT_TITLE:
+                                await download_from_grid(r_grid, query, next_s, res_tag)
+
+                await client.send_message(
+                    "me",
+                    f"🏁 <b>Finished:</b> <code>{cmd['raw']}</code>\n"
+                    f"📋 <b>Remaining in Queue:</b> <code>{len(TITLE_QUEUE)}</code>",
+                    parse_mode="HTML"
+                )
                 await asyncio.sleep(2.0)
-                s_grid, _, s_res_list = await navigate_to_grid(query, next_s, target_res=None, send_fresh=True)
-                if not s_grid:
-                    continue
-                s_resolutions = s_res_list if s_res_list else ["1080P"]
-                await download_from_grid(s_grid, query, next_s, s_resolutions[0])
-
-                for res_tag in s_resolutions[1:]:
-                    await asyncio.sleep(1.5)
-                    r_grid, _, _ = await navigate_to_grid(query, next_s, target_res=res_tag, send_fresh=True)
-                    if r_grid:
-                        await download_from_grid(r_grid, query, next_s, res_tag)
-
-            await client.send_message(
-                "me",
-                f"🏁 <b>Finished Everything for:</b> <code>{query}</code>\n"
-                f"All available seasons and resolutions have been verified and published!",
-                parse_mode="HTML"
-            )
-    except Exception as e:
-        print(f"⚠️ Master pipeline error: {e}")
+            except Exception as item_err:
+                print(f"⚠️ Error on queue item (recovering & continuing): {item_err}")
+                await asyncio.sleep(2.0)
     finally:
         CURRENT_PIPELINE_ACTIVE = False
         ACTIVE_EP_TAG = ""
         ACTIVE_RES_TAG = ""
 
-def enqueue_title(query: str, send_initial: bool = True):
-    TITLE_QUEUE.append((query, send_initial))
-    asyncio.create_task(process_queue())
+def enqueue_commands_bulk(raw_text: str, send_initial: bool = True) -> list:
+    raw_items = split_bulk_commands(raw_text)
+    parsed_list = []
+    for item in raw_items:
+        cmd = parse_smart_user_command(item)
+        if cmd["title"] and len(cmd["title"]) >= 2:
+            TITLE_QUEUE.append((cmd, send_initial))
+            parsed_list.append(cmd)
+
+    if parsed_list:
+        asyncio.create_task(process_queue())
+    return parsed_list
 
 # ============================================================================
-# 12. TRIGGERS: SAVED MESSAGES OR TYPING IN SOURCE_BOT CHAT
+# 11. SAVED MESSAGES & SOURCE_BOT TRIGGERS
 # ============================================================================
 @client.on(events.NewMessage(outgoing=True))
 async def on_outgoing_trigger(event):
+    global SKIP_CURRENT_TITLE, ME_USER_ID
     text = (event.message.text or "").strip()
-    if not text or text.startswith(("/", "✅", "⏳", "🏁", "⚠️", "🔗")):
+    if not text or text.startswith(("/", "✅", "⏳", "🏁", "⚠️", "🔗", "📋", "🛑", "🔎")):
         return
 
-    me = await client.get_me()
-    if event.chat_id == me.id:
-        query = re.sub(r"^\.get\s+", "", text, flags=re.I).strip()
-        pos = len(TITLE_QUEUE) + (1 if CURRENT_PIPELINE_ACTIVE else 0)
-        await event.reply(
-            f"⏳ <b>Queued (#{pos}):</b> <code>{query}</code> (All Resolutions + Cross-Channel Dedup)",
-            parse_mode="HTML"
-        )
-        enqueue_title(query, send_initial=True)
+    if ME_USER_ID is None:
+        ME_USER_ID = (await client.get_me()).id
+
+    if event.chat_id == ME_USER_ID:
+        low = text.lower()
+
+        if low in (".queue", ".status", "queue", "status"):
+            q_list = "\n".join(
+                f"  {i+1}. <code>{t[0]['raw'] if isinstance(t[0], dict) else t[0]}</code>"
+                for i, t in enumerate(TITLE_QUEUE)
+            ) or "  <i>(Empty)</i>"
+            await event.reply(
+                f"📋 <b>Multi-Queue Status</b>\n"
+                f"• <b>Active:</b> <code>{ACTIVE_CLEAN_TITLE or 'Idle'}</code> ({ACTIVE_SEASON_TAG} • {ACTIVE_RES_TAG or '-'})\n"
+                f"• <b>Waiting ({len(TITLE_QUEUE)}):</b>\n{q_list}",
+                parse_mode="HTML"
+            )
+            return
+
+        if low in (".skip", "skip"):
+            SKIP_CURRENT_TITLE = True
+            FILE_COMPLETED_EVENT.set()
+            await event.reply(f"🛑 <b>Skipping:</b> <code>{ACTIVE_CLEAN_TITLE}</code>", parse_mode="HTML")
+            return
+
+        if low in (".clear", "clear"):
+            count = len(TITLE_QUEUE)
+            TITLE_QUEUE.clear()
+            await event.reply(f"🛑 <b>Cleared {count} items from queue.</b>", parse_mode="HTML")
+            return
+
+        added = enqueue_commands_bulk(text, send_initial=True)
+        if added:
+            summary_lines = []
+            for c in added[:8]:
+                if c["mode"] == "missing":
+                    summary_lines.append(f"• 🔍 <b>Missing Audit:</b> <code>{c['title']}</code>")
+                elif c["mode"] == "range":
+                    s_lbl = f"S{c['season']:02d}" if c["season"] else "S01"
+                    e_lbl = ", ".join(f"E{e:02d}" for e in (c["episodes"] or [])[:8])
+                    summary_lines.append(f"• 🎯 <b>Selective:</b> <code>{c['title']}</code> ({s_lbl}: {e_lbl})")
+                else:
+                    summary_lines.append(f"• 🎬 <b>Full Sync:</b> <code>{c['title']}</code>")
+
+            if len(added) > 8:
+                summary_lines.append(f"<i>...and +{len(added)-8} more</i>")
+
+            await event.reply(
+                f"⏳ <b>Queued {len(added)} Task(s):</b>\n" + "\n".join(summary_lines),
+                parse_mode="HTML"
+            )
         return
 
     chat = await event.get_chat()
     chat_username = (getattr(chat, "username", "") or "").lower()
     if chat_username == SOURCE_BOT.lower() and not CURRENT_PIPELINE_ACTIVE:
-        print(f"🎯 Manual search detected in @{SOURCE_BOT}: {text}")
-        enqueue_title(text, send_initial=False)
+        enqueue_commands_bulk(text, send_initial=False)
 
 # ============================================================================
-# 13. RENDER HEALTH CHECK SERVER & MAIN ENTRYPOINT
+# 12. 24/7 KEEP-ALIVE SELF-PING & RENDER HEALTH SERVER
 # ============================================================================
+async def keep_alive_worker():
+    """Pings the local/external HTTP server every 10 minutes so Render never sleeps."""
+    target_url = RENDER_EXTERNAL_URL or f"http://127.0.0.1:{PORT}/"
+    while True:
+        await asyncio.sleep(600)
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(target_url, timeout=10):
+                    pass
+        except Exception:
+            pass
+
 async def handle_ping(request):
     return web.json_response({
         "status": "online",
@@ -1099,8 +1447,7 @@ async def handle_ping(request):
         "queue_length": len(TITLE_QUEUE),
         "active_title": ACTIVE_CLEAN_TITLE,
         "active_season": ACTIVE_SEASON_TAG,
-        "active_resolution": ACTIVE_RES_TAG,
-        "green_buttons_enabled": bool(BOT_TOKEN)
+        "active_resolution": ACTIVE_RES_TAG
     })
 
 async def start_web_server():
@@ -1113,16 +1460,18 @@ async def start_web_server():
     print(f"🌐 HTTP Health server running on port {PORT}")
 
 async def main():
+    global ME_USER_ID
     await start_web_server()
     if not SESSION_STRING:
         print("❌ ERROR: SESSION_STRING environment variable is missing!")
         return
 
-    if not BOT_TOKEN:
-        print("⚠️ WARNING: BOT_TOKEN is not set! Add BOT_TOKEN in Render Environment so Green Inline Buttons appear on files.")
-
     await client.start()
-    print(f"🚀 Unstoppable Media Pipeline LIVE! Watching @{SOURCE_BOT} and Saved Messages.")
+    ME_USER_ID = (await client.get_me()).id
+    await ensure_dialogs_cached()
+    asyncio.create_task(keep_alive_worker())
+
+    print(f"🚀 Non-Stop Autonomous Media Pipeline is LIVE! Watching @{SOURCE_BOT} and Saved Messages.")
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
