@@ -6,12 +6,12 @@ from aiohttp import web
 import aiohttp
 
 # ============================================================================
-# PYTHON 3.10+ / 3.12+ EVENT LOOP
+# EVENT LOOP COMPATIBILITY
 # ============================================================================
 loop = asyncio.new_event_loop()
 asyncio.set_event_loop(loop)
 
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
@@ -26,7 +26,6 @@ SESSION_STRING = os.environ.get("SESSION_STRING", "")
 TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "")
 OMDB_API_KEY = os.environ.get("OMDB_API_KEY", "")
 
-# Target Storage Channels Mapping
 DEFAULT_CHANNELS = {
     "hindi": -1004364094932,
     "english": -1003900997247,
@@ -48,6 +47,15 @@ CATEGORY_EMOJIS = {
     "animation": "🧸", "upcoming": "🔔", "turkish": "🇹🇷", "other": "🎬"
 }
 
+# The 3 reference inline buttons
+INLINE_BUTTONS = [
+    [
+        Button.url("Series ↗", "https://t.me/thebackroomseries"),
+        Button.url("Anime ↗", "https://t.me/thebackroomanime"),
+        Button.url("Movies ↗", "https://t.me/thebackroommovies")
+    ]
+]
+
 INDIAN_LANG_CODES = {"hi", "te", "ta", "ml", "kn", "bn", "mr", "pa", "gu", "ur"}
 SOURCE_BOT = "fileserverxrobot"
 PORT = int(os.environ.get("PORT", 10000))
@@ -55,11 +63,13 @@ PORT = int(os.environ.get("PORT", 10000))
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH, loop=loop)
 
 NAV_LOCK = asyncio.Lock()
-PROCESSED_BUTTONS = set()
+FILE_COMPLETED_EVENT = asyncio.Event()
+PROCESSED_EPISODES = set()
 CAPTURED_FILES = set()
+IS_DOWNLOADING_QUEUE = False
 
 # ============================================================================
-# 2. MULTI-DUB, SPEC & TECHNICAL CAPTION EXTRACTION
+# 2. METADATA & TECHNICAL CAPTION PARSER
 # ============================================================================
 def extract_real_filename(filename="", caption=""):
     cap = str(caption or "")
@@ -74,18 +84,15 @@ def extract_tech_specs(filename="", caption=""):
     real_fn = extract_real_filename(filename, caption)
     combined = f"{real_fn}\n{caption or ''}"
 
-    # Resolution detection (360p, 480p, 720p, 1080p, 2160p / 4K)
     qual_m = re.search(r"\b(360p|480p|540p|720p|1080p|1440p|2160p|4K)\b", combined, re.I)
     quality = qual_m.group(1).upper() if qual_m else "HD"
 
-    # Codec detection
     codec = "x264"
     if re.search(r"\b(x265|h265|hevc)\b", combined, re.I):
         codec = "HEVC x265"
     elif re.search(r"\bav1\b", combined, re.I):
         codec = "AV1"
 
-    # Bitrate & Duration
     br_m = re.search(r"Video\s*Bitrate\s*:\s*([^\r\n]+)", combined, re.I) or re.search(r"\b(\d{3,5}\s*kbps)\b", combined, re.I)
     bitrate = br_m.group(1).strip() if br_m else ""
 
@@ -95,7 +102,6 @@ def extract_tech_specs(filename="", caption=""):
     for_tv = bool(re.search(r"Can\s*be\s*played\s*on\s*TV|FOR\s*TV", combined, re.I) or "x264" in codec)
     has_sub = bool(re.search(r"Has\s*[a-zA-Z]*\s*subtitles|\b(?:sub|subs|esub|multisub)\b|\.mkv\b", combined, re.I))
 
-    # Multi-Audio list parsing
     audio_lines = []
     aud_section = re.search(r"Audio\s*List\s*:\s*((?:\r?\n\s*\*[^\r\n]+)+)", caption or "", re.I)
     if aud_section:
@@ -103,9 +109,8 @@ def extract_tech_specs(filename="", caption=""):
             if ln.strip().startswith("*"):
                 audio_lines.append(ln.strip())
 
-    # Fallback multi-dub detection from text
     if not audio_lines:
-        detected_dubs = []
+        detected = []
         for pat, name in [
             (r"\b(?:hindi|hin)\b", "Hindi"),
             (r"\b(?:english|eng)\b", "English"),
@@ -113,14 +118,11 @@ def extract_tech_specs(filename="", caption=""):
             (r"\b(?:korean|kor)\b", "Korean"),
             (r"\b(?:tamil|tam)\b", "Tamil"),
             (r"\b(?:telugu|tel)\b", "Telugu"),
-            (r"\b(?:amharic|amh|ትርጉም)\b", "Amharic"),
+            (r"\b(?:amharic|amh|ትርጉም)\b", "Amharic")
         ]:
             if re.search(pat, combined, re.I):
-                detected_dubs.append(name)
-        if detected_dubs:
-            audio_lines = [f"* AAC 2.0 — {' + '.join(detected_dubs)}"]
-        else:
-            audio_lines = ["* AAC 2.0 — Dual Audio"]
+                detected.append(name)
+        audio_lines = [f"* AAC 2.0 — {' + '.join(detected) if detected else 'Dual Audio'}"]
 
     return {
         "real_filename": real_fn,
@@ -133,7 +135,7 @@ def extract_tech_specs(filename="", caption=""):
         "audio_lines": audio_lines
     }
 
-def build_final_caption(filename, caption, meta_runtime="", meta_lang=""):
+def build_final_caption(filename, caption, meta_runtime=""):
     sp = extract_tech_specs(filename, caption)
     dur = sp["duration"] or meta_runtime
 
@@ -168,22 +170,20 @@ def build_final_caption(filename, caption, meta_runtime="", meta_lang=""):
     return "\n".join(lines)
 
 # ============================================================================
-# 3. METADATA & GENRE-BASED CATEGORIZATION ENGINE
+# 3. TMDB/OMDB METADATA & GENRE ROUTING
 # ============================================================================
 async def fetch_meta(title):
     clean = re.sub(r"\b(S\d{1,2}|E\d{1,3}|1080p|720p|480p|360p|BluRay|Pahe|MKV|MP4|HEVC)\b.*$", "", title, flags=re.I)
     clean = re.sub(r"[._\-]+", " ", clean).strip()
 
-    genres = ""
-    lang = ""
-    runtime = ""
+    genres, lang, runtime = "", "", ""
     is_series = bool(re.search(r"\b(S\d{1,2}\s*E\d{1,3}|Season|Episode)\b", title, re.I))
 
     async with aiohttp.ClientSession() as session:
         if TMDB_API_KEY:
             try:
-                tmdb_url = f"https://api.themoviedb.org/3/search/multi?api_key={TMDB_API_KEY}&query={clean}"
-                async with session.get(tmdb_url, timeout=5) as r:
+                url = f"https://api.themoviedb.org/3/search/multi?api_key={TMDB_API_KEY}&query={clean}"
+                async with session.get(url, timeout=5) as r:
                     if r.status == 200:
                         data = await r.json()
                         res = (data.get("results") or [{}])[0]
@@ -195,8 +195,8 @@ async def fetch_meta(title):
 
         if OMDB_API_KEY:
             try:
-                omdb_url = f"https://www.omdbapi.com/?apikey={OMDB_API_KEY}&t={clean}"
-                async with session.get(omdb_url, timeout=5) as r:
+                url = f"https://www.omdbapi.com/?apikey={OMDB_API_KEY}&t={clean}"
+                async with session.get(url, timeout=5) as r:
                     if r.status == 200:
                         data = await r.json()
                         if data.get("Response") == "True":
@@ -245,7 +245,7 @@ def detect_category(filename, caption, meta):
     return "english"
 
 # ============================================================================
-# 4. AUTO-JOIN CHANNELS (Force-Subscribe Bypass)
+# 4. AUTO-JOIN CHANNELS (FSUB BYPASS)
 # ============================================================================
 async def auto_join_channel(url: str):
     try:
@@ -264,7 +264,7 @@ async def auto_join_channel(url: str):
         return False
 
 # ============================================================================
-# 5. INCOMING MEDIA RECEIVER: PARSE & DISPATCH TO STORAGE CHANNELS
+# 5. INCOMING MEDIA RECEIVER: FORWARD WITH BUTTONS & TRIGGER NEXT EPISODE
 # ============================================================================
 @client.on(events.NewMessage(incoming=True))
 async def on_media_arrival(event):
@@ -284,25 +284,22 @@ async def on_media_arrival(event):
     raw_fn = msg.file.name or (msg.text or "Media.mkv").split("\n")[0]
     caption = msg.text or ""
 
-    print(f"📥 Captured media file: {raw_fn}")
+    print(f"📥 Received file: {raw_fn}")
 
-    # 1. Fetch Metadata
     meta = await fetch_meta(raw_fn)
-
-    # 2. Determine Channel Category
     cat = detect_category(raw_fn, caption, meta)
     dest_channel = DEFAULT_CHANNELS.get(cat, DEFAULT_CHANNELS["other"])
     cat_emoji = CATEGORY_EMOJIS.get(cat, "📁")
 
-    # 3. Build Spec Caption
-    final_caption = build_final_caption(raw_fn, caption, meta.get("runtime", ""), meta.get("language", ""))
+    final_caption = build_final_caption(raw_fn, caption, meta.get("runtime", ""))
 
-    # 4. Forward directly to target channel before 60s auto-delete expires
     try:
+        # Forward with the 3 inline buttons before 60s deletion
         await client.send_file(
             dest_channel,
             file=msg.media,
             caption=final_caption,
+            buttons=INLINE_BUTTONS,
             parse_mode="HTML"
         )
         print(f"🚀 Published to {cat_emoji} {cat.upper()} channel ({dest_channel})")
@@ -317,9 +314,95 @@ async def on_media_arrival(event):
         )
     except Exception as e:
         print(f"❌ Storage Forward error: {e}")
+    finally:
+        # Signal the queue that this file is done; proceed to the next episode
+        FILE_COMPLETED_EVENT.set()
 
 # ============================================================================
-# 6. ADVANCED AUTONOMOUS BUTTON ENGINE (All Qualities, Seasons & Episodes)
+# 6. SEQUENTIAL QUEUE PROCESSOR: DOWNLOADS EVERY EPISODE & HANDLES PAGES
+# ============================================================================
+async def process_all_episodes(bot_username, current_msg):
+    global IS_DOWNLOADING_QUEUE
+    if IS_DOWNLOADING_QUEUE:
+        return
+    IS_DOWNLOADING_QUEUE = True
+
+    try:
+        while True:
+            # 1. Gather all unique episode buttons on the current page
+            episode_buttons = []
+            seen_tags = set()
+            next_btn = None
+
+            for row in current_msg.buttons:
+                for btn in row:
+                    txt = btn.text or ""
+                    if any(nav in txt.lower() for nav in ["back", "close", "cancel"]):
+                        continue
+                    if "next" in txt.lower() or "⏩" in txt:
+                        next_btn = btn
+                        continue
+
+                    m = re.search(r"\b(E\d{1,3})\b", txt, re.I)
+                    ep_tag = m.group(1).upper() if m else txt
+
+                    if ep_tag not in seen_tags and ep_tag not in PROCESSED_EPISODES:
+                        seen_tags.add(ep_tag)
+                        episode_buttons.append((ep_tag, btn))
+
+            print(f"📋 Found {len(episode_buttons)} episodes to download on this page.")
+
+            # 2. Iterate through each episode sequentially
+            for ep_tag, btn in episode_buttons:
+                PROCESSED_EPISODES.add(ep_tag)
+                FILE_COMPLETED_EVENT.clear()
+
+                print(f"⏳ Triggering episode {ep_tag} ({btn.text})...")
+
+                try:
+                    if getattr(btn, "url", None) and "start=" in btn.url:
+                        parsed = urlparse(btn.url)
+                        b_uname = parsed.path.strip("/")
+                        param = parse_qs(parsed.query).get("start", [""])[0]
+                        if b_uname and param:
+                            await client.send_message(b_uname, f"/start {param}")
+                    elif getattr(btn, "data", None):
+                        await btn.click()
+                except Exception as err:
+                    print(f"⚠️ Click error on {ep_tag}: {err}")
+                    continue
+
+                # Wait until the file arrives and forwards (timeout after 90 seconds)
+                try:
+                    await asyncio.wait_for(FILE_COMPLETED_EVENT.wait(), timeout=90)
+                    print(f"✅ Successfully finished {ep_tag}. Cooling down 4 seconds...")
+                except asyncio.TimeoutError:
+                    print(f"⚠️ Timeout waiting for {ep_tag}. Proceeding to next episode...")
+
+                await asyncio.sleep(4)
+
+            # 3. Check for Next Page (e.g. Page 1 of 4 -> Page 2)
+            if next_btn and "next" in (next_btn.text or "").lower():
+                print("📄 Moving to Next Page of episodes...")
+                try:
+                    await next_btn.click()
+                    await asyncio.sleep(3)
+                    msgs = await client.get_messages(SOURCE_BOT, limit=1)
+                    current_msg = msgs[0]
+                    if not current_msg.buttons:
+                        break
+                except Exception as err:
+                    print(f"⚠️ Could not paginate: {err}")
+                    break
+            else:
+                print("🎉 All episodes and pages completed!")
+                break
+
+    finally:
+        IS_DOWNLOADING_QUEUE = False
+
+# ============================================================================
+# 7. NAVIGATION CONTROLLER: TITLE -> SEASON -> QUALITY -> QUEUE
 # ============================================================================
 @client.on(events.NewMessage(chats=SOURCE_BOT))
 @client.on(events.MessageEdited(chats=SOURCE_BOT))
@@ -328,7 +411,6 @@ async def handle_bot_menus(event):
     if not msg or not msg.buttons:
         return
 
-    msg_id = msg.id
     msg_text = (msg.text or "").lower()
 
     async with NAV_LOCK:
@@ -350,14 +432,14 @@ async def handle_bot_menus(event):
                         await btn.click()
                         return
 
-        # B. Title Matching List
+        # B. Title Selection
         if "choose the correct title" in msg_text or "matching results" in msg_text:
             btn = msg.buttons[0][0]
             print(f"🔘 Step 1: Selecting Title -> {btn.text}")
             await btn.click()
             return
 
-        # C. Season Selection (Defaults to Season 01, handles multi-seasons)
+        # C. Season Selection (Pick Season 01, ignore 'Season ALL')
         if "choose the season" in msg_text or ("season" in msg_text and "quality" not in msg_text):
             target_season = None
             for row in msg.buttons:
@@ -384,10 +466,9 @@ async def handle_bot_menus(event):
                 await target_season.click()
             return
 
-        # D. Quality Selection (360p, 480p, 720p, 1080p)
+        # D. Quality Selection (1080P BluRay/Pahe -> 720P -> 480P)
         if "select the available quality" in msg_text or "quality" in msg_text:
             target_quality = None
-            # Check highest quality down to 480p/360p
             for preferred in ["1080P", "720P", "480P", "360P"]:
                 for row in msg.buttons:
                     for btn in row:
@@ -414,42 +495,13 @@ async def handle_bot_menus(event):
                 await target_quality.click()
             return
 
-        # E. Multi-Episode Downloads (E01, E02, E03...)
+        # E. Episodes Grid: Launch the Sequential Queue
         if "total episodes" in msg_text or any(re.search(r"\bE\d{1,3}\b", b.text or "", re.I) for r in msg.buttons for b in r):
-            unique_eps = {}
-            for row in msg.buttons:
-                for btn in row:
-                    txt = btn.text or ""
-                    if any(nav in txt.lower() for nav in ["next", "back", "close", "page"]):
-                        continue
-                    m = re.search(r"\b(E\d{1,3})\b", txt, re.I)
-                    ep_tag = m.group(1).upper() if m else txt
-                    if ep_tag not in unique_eps:
-                        unique_eps[ep_tag] = btn
-
-            for ep_tag, btn in unique_eps.items():
-                btn_key = f"{msg_id}_{ep_tag}"
-                if btn_key in PROCESSED_BUTTONS:
-                    continue
-                PROCESSED_BUTTONS.add(btn_key)
-
-                print(f"📥 Requesting file: {btn.text}")
-                try:
-                    if getattr(btn, "url", None) and "start=" in btn.url:
-                        parsed = urlparse(btn.url)
-                        b_uname = parsed.path.strip("/")
-                        param = parse_qs(parsed.query).get("start", [""])[0]
-                        if b_uname and param:
-                            await client.send_message(b_uname, f"/start {param}")
-                            await asyncio.sleep(4)
-                    elif getattr(btn, "data", None):
-                        await btn.click()
-                        await asyncio.sleep(4)
-                except Exception as err:
-                    print(f"⚠️ Button error: {err}")
+            if not IS_DOWNLOADING_QUEUE:
+                asyncio.create_task(process_all_episodes(SOURCE_BOT, msg))
 
 # ============================================================================
-# 7. TRIGGER FROM SAVED MESSAGES (Type Title to Search)
+# 8. SAVED MESSAGES TRIGGER
 # ============================================================================
 @client.on(events.NewMessage(chats="me", outgoing=True))
 async def on_saved_messages_trigger(event):
@@ -458,13 +510,13 @@ async def on_saved_messages_trigger(event):
         return
 
     query = re.sub(r"^\.get\s+", "", text, flags=re.I).strip()
-    PROCESSED_BUTTONS.clear()
+    PROCESSED_EPISODES.clear()
 
-    await event.reply(f"⏳ <b>Searching @{SOURCE_BOT} for:</b> <code>{query}</code>...", parse_mode="HTML")
+    await event.reply(f"⏳ <b>Auto-downloading full series/movie:</b> <code>{query}</code>...", parse_mode="HTML")
     await client.send_message(SOURCE_BOT, query)
 
 # ============================================================================
-# 8. RENDER HEALTH CHECK SERVER & ENTRYPOINT
+# 9. RENDER HEALTH CHECK SERVER & MAIN ENTRYPOINT
 # ============================================================================
 async def handle_ping(request):
     return web.json_response({"status": "running", "service": "Autonomous Media Engine"})
@@ -485,7 +537,7 @@ async def main():
 
     await client.start()
     print("🚀 Autonomous Media Engine is LIVE!")
-    print("💡 Send any movie/series title into your Telegram 'Saved Messages' to begin.")
+    print("💡 Send any title to 'Saved Messages' to download all episodes sequentially.")
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
