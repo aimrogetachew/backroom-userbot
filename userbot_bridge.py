@@ -5,9 +5,7 @@ from aiohttp import web
 import aiohttp
 from urllib.parse import urlparse, parse_qs
 
-# ============================================================================
-# PYTHON 3.10+ / 3.12+ COMPATIBILITY: EXPLICIT EVENT LOOP CREATION
-# ============================================================================
+# Explicit loop for Python 3.10+ / 3.12+ compatibility on Render
 loop = asyncio.new_event_loop()
 asyncio.set_event_loop(loop)
 
@@ -17,18 +15,16 @@ from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
 
 # ============================================================================
-# 1. CONFIGURATION (Read from Render Environment Variables)
+# 1. CONFIGURATION
 # ============================================================================
 API_ID = int(os.environ.get("API_ID", "7598862"))
 API_HASH = os.environ.get("API_HASH", "fea8fb2a9cb4d31ff6f53e2d499801ee")
 SESSION_STRING = os.environ.get("SESSION_STRING", "")
 
-# Your Cloudflare Worker URL
 WORKER_URL = os.environ.get("WORKER_URL", "https://autumn-violet-afc2.aimrogetachew771.workers.dev")
 USERBOT_SECRET = os.environ.get("USERBOT_SECRET", "backroom_secret_2026")
 TARGET_DESTINATION = os.environ.get("TARGET_DESTINATION", "@Thebackroom_1")
 SOURCE_BOT = "fileserverxrobot"
-
 PORT = int(os.environ.get("PORT", 10000))
 
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH, loop=loop)
@@ -38,221 +34,208 @@ def parse_target(dest):
         return int(dest)
     return dest
 
+# State trackers to prevent duplicate clicks
+PROCESSING_MSGS = set()
+CLICKED_EPISODES = set()
+
 # ============================================================================
-# 2. AUTO-JOIN CHANNELS (Force-Subscribe Bypass)
+# 2. AUTO-JOIN CHANNELS (Bypass Force-Subscribe Locks)
 # ============================================================================
 async def auto_join_channel(url: str):
-    """Automatically joins required Telegram channels to bypass FSUB locks."""
     try:
         if "+" in url or "joinchat" in url:
             invite_hash = url.split("+")[-1].split("/")[-1].strip()
             await client(ImportChatInviteRequest(invite_hash))
-            print(f"✅ Joined private channel via invite: {url}")
+            print(f"✅ Auto-joined private channel: {url}")
         else:
             uname = url.split("t.me/")[-1].split("/")[0].split("?")[0].strip()
             if uname:
                 await client(JoinChannelRequest(uname))
-                print(f"✅ Joined public channel: @{uname}")
+                print(f"✅ Auto-joined public channel: @{uname}")
         return True
     except Exception as e:
-        print(f"⚠️ Channel join error for {url}: {e}")
+        print(f"⚠️ Channel join error: {e}")
         return False
 
 # ============================================================================
-# 3. INSTANT MEDIA FORWARDER (BEATS THE 1-MINUTE AUTO-DELETE)
+# 3. AUTONOMOUS STEP-BY-STEP NAVIGATOR (Handles New & Edited Messages)
 # ============================================================================
-@client.on(events.NewMessage(incoming=True))
-async def on_incoming_file(event):
-    sender = await event.get_sender()
-    sender_username = (getattr(sender, "username", "") or "").lower()
-
-    # Capture files sent by the fileserver bot
-    if sender_username != SOURCE_BOT and not getattr(sender, "bot", False):
+@client.on(events.NewMessage(chats=SOURCE_BOT))
+@client.on(events.MessageEdited(chats=SOURCE_BOT))
+async def on_fileserver_message(event):
+    msg = event.message
+    if not msg:
         return
 
-    if not (event.video or event.document):
+    # A. IF A MEDIA FILE ARRIVED -> FORWARD IMMEDIATELY BEFORE AUTO-DELETE
+    if msg.video or msg.document:
+        file_size = msg.file.size if msg.file else 0
+        if file_size > 5 * 1024 * 1024:  # Ignore small clips (< 5MB)
+            dest = parse_target(TARGET_DESTINATION)
+            try:
+                await client.send_file(
+                    dest,
+                    file=msg.media,
+                    caption=msg.text or ""
+                )
+                print(f"🚀 [AUTO-CAPTURED] Forwarded {file_size // (1024*1024)} MB to {dest}!")
+            except Exception as e:
+                print(f"❌ Forward error: {e}")
         return
 
-    file_size = event.file.size if event.file else 0
-    if file_size < 5 * 1024 * 1024:  # Ignore small stickers/clips (< 5MB)
+    # B. IF INLINE BUTTONS ARE PRESENT -> NAVIGATE AUTONOMOUSLY
+    if not msg.buttons:
         return
 
-    dest = parse_target(TARGET_DESTINATION)
-    raw_caption = event.message.text or ""
+    msg_id = msg.id
+    msg_text = (msg.text or "").lower()
+
+    # Prevent concurrent clicking on the exact same message update
+    if msg_id in PROCESSING_MSGS:
+        return
+    PROCESSING_MSGS.add(msg_id)
 
     try:
-        # Forward immediately to your target storage bot/channel
-        await client.send_file(
-            dest,
-            file=event.message.media,
-            caption=raw_caption
-        )
-        print(f"🚀 [AUTO-CAPTURED] Forwarded {file_size // (1024*1024)} MB to {dest} before auto-delete!")
-    except Exception as e:
-        print(f"❌ Forwarding error: {e}")
-
-# ============================================================================
-# 4. HIERARCHICAL NAVIGATION (Title -> Season -> Quality -> Episodes)
-# ============================================================================
-async def pull_movie_from_fileserver(query: str, max_episodes: int = 25) -> int:
-    print(f"🔎 Starting deep navigation for: {query}")
-    total_triggered = 0
-
-    try:
-        # 1. Send query
-        sent = await client.send_message(SOURCE_BOT, query)
-        await asyncio.sleep(3)
-
-        # 2. Get latest response
-        msgs = await client.get_messages(SOURCE_BOT, limit=2)
-        if not msgs or not msgs[0].buttons:
-            print("⚠️ No buttons received from search query.")
-            return 0
-        current_msg = msgs[0]
-
-        # 3. CHECK FOR FORCE-SUBSCRIBE (Must join channels first)
+        # --- 1. FORCE-SUBSCRIBE CHECK ---
         joined_any = False
-        for row in current_msg.buttons:
+        for row in msg.buttons:
             for btn in row:
-                if btn.url and ("t.me/" in btn.url):
-                    text_lower = (btn.text or "").lower()
-                    if any(w in text_lower for w in ["join", "channel", "subscribe", "group"]):
+                if btn.url and "t.me/" in btn.url:
+                    b_txt = (btn.text or "").lower()
+                    if any(w in b_txt for w in ["join", "channel", "subscribe", "group"]):
                         await auto_join_channel(btn.url)
                         joined_any = True
-                        await asyncio.sleep(2)
+                        await asyncio.sleep(1.5)
 
         if joined_any:
-            # Click Try Again / Joined / Refresh button
-            for row in current_msg.buttons:
+            for row in msg.buttons:
                 for btn in row:
-                    t_low = (btn.text or "").lower()
-                    if any(w in t_low for w in ["try again", "joined", "continue", "refresh", "check"]):
+                    b_txt = (btn.text or "").lower()
+                    if any(w in b_txt for w in ["try again", "joined", "continue", "refresh", "check"]):
+                        print("🔘 Clicking 'Try Again' after joining channels...")
                         await btn.click()
-                        await asyncio.sleep(3)
-                        msgs = await client.get_messages(SOURCE_BOT, limit=1)
-                        current_msg = msgs[0]
-                        break
+                        return
 
-        # 4. STEP A: SELECT TITLE (if search returns a list of results)
-        if current_msg.buttons:
-            first_btn = current_msg.buttons[0][0]
-            btn_txt = first_btn.text or ""
-            # If buttons represent search results (e.g. "Demon Slayer - 5 Seasons")
-            if not any(w in btn_txt.lower() for w in ["season 01", "season 1", "1080p", "720p", "e01"]):
-                print(f"🔘 Selecting title: {btn_txt}")
-                await first_btn.click()
-                await asyncio.sleep(3)
-                msgs = await client.get_messages(SOURCE_BOT, limit=1)
-                current_msg = msgs[0]
+        # --- 2. TITLE SELECTION (if bot gives matching titles list) ---
+        if "choose the correct title" in msg_text or "matching results" in msg_text:
+            first_btn = msg.buttons[0][0]
+            print(f"🔘 Step 1: Selecting Title -> {first_btn.text}")
+            await first_btn.click()
+            return
 
-        # 5. STEP B: SELECT SEASON (Choose Season 01 by default)
-        season_clicked = False
-        if current_msg.buttons:
-            for row in current_msg.buttons:
+        # --- 3. SEASON SELECTION (Specifically pick Season 01, ignore 'Season ALL') ---
+        if "choose the season" in msg_text or "season" in msg_text and not "quality" in msg_text:
+            target_season = None
+            for row in msg.buttons:
                 for btn in row:
-                    b_text = (btn.text or "").lower()
-                    if "season 01" in b_text or "season 1" in b_text or "season" in b_text:
-                        print(f"🔘 Selecting season: {btn.text}")
-                        await btn.click()
-                        season_clicked = True
-                        await asyncio.sleep(3)
-                        msgs = await client.get_messages(SOURCE_BOT, limit=1)
-                        current_msg = msgs[0]
+                    b_txt = (btn.text or "").lower()
+                    # Specifically look for Season 01 or Season 1
+                    if "season 01" in b_txt or "season 1" in b_txt or "s01" in b_txt:
+                        target_season = btn
                         break
-                if season_clicked:
+                if target_season:
                     break
 
-        # 6. STEP C: SELECT QUALITY (Prefer 1080p or 720p PAHE/Bluray)
-        quality_clicked = False
-        if current_msg.buttons:
-            # Check for best quality available
-            target_btn = None
-            for row in current_msg.buttons:
-                for btn in row:
-                    b_text = (btn.text or "").upper()
-                    if "1080P" in b_text and ("PAHE" in b_text or "BLURAY" in b_text):
-                        target_btn = btn
+            # Fallback to first season if Season 01 label is slightly different
+            if not target_season:
+                for row in msg.buttons:
+                    for btn in row:
+                        b_txt = (btn.text or "").lower()
+                        if "season" in b_txt and "all" not in b_txt:
+                            target_season = btn
+                            break
+                    if target_season:
                         break
-                    elif "720P" in b_text and not target_btn:
-                        target_btn = btn
-                if target_btn:
+
+            if target_season:
+                print(f"🔘 Step 2: Selecting Season -> {target_season.text}")
+                await target_season.click()
+                return
+
+        # --- 4. QUALITY SELECTION (1080p Bluray/Pahe or 720p) ---
+        if "select the available quality" in msg_text or "quality" in msg_text:
+            target_quality = None
+            for row in msg.buttons:
+                for btn in row:
+                    b_txt = (btn.text or "").upper()
+                    if "1080P" in b_txt and ("PAHE" in b_txt or "BLURAY" in b_txt):
+                        target_quality = btn
+                        break
+                    elif "720P" in b_txt and not target_quality:
+                        target_quality = btn
+                if target_quality:
                     break
 
-            # If preferred isn't found, pick the first quality row
-            if not target_btn and current_msg.buttons:
-                target_btn = current_msg.buttons[0][0]
-
-            if target_btn and not any(nav in (target_btn.text or "").lower() for nav in ["back", "close"]):
-                print(f"🔘 Selecting quality: {target_btn.text}")
-                await target_btn.click()
-                quality_clicked = True
-                await asyncio.sleep(3)
-                msgs = await client.get_messages(SOURCE_BOT, limit=1)
-                current_msg = msgs[0]
-
-        # 7. STEP D: CLICK EPISODES (E01, E02, E03...)
-        if current_msg.buttons:
-            print(f"📦 Extracting episode files from: {current_msg.buttons[0][0].text or 'Menu'}")
-            clicked_episodes = set()
-
-            for row in current_msg.buttons:
-                for btn in row:
-                    if total_triggered >= max_episodes:
+            if not target_quality and msg.buttons:
+                # Pick the first quality button that isn't Back/Close
+                for row in msg.buttons:
+                    for btn in row:
+                        if not any(nav in (btn.text or "").lower() for nav in ["back", "close", "next"]):
+                            target_quality = btn
+                            break
+                    if target_quality:
                         break
 
-                    b_text = btn.text or ""
-                    # Skip navigation buttons
-                    if any(nav in b_text.lower() for nav in ["next", "back", "close", "page", "cancel"]):
+            if target_quality:
+                print(f"🔘 Step 3: Selecting Quality -> {target_quality.text}")
+                await target_quality.click()
+                return
+
+        # --- 5. EPISODE DOWNLOAD BUTTONS (E01, E02...) ---
+        if "total episodes" in msg_text or any(re.search(r"\bE\d{1,3}\b", btn.text or "", re.I) for r in msg.buttons for btn in r):
+            print("📦 Step 4: Episode grid detected! Clicking episode links...")
+            count = 0
+
+            for row in msg.buttons:
+                for btn in row:
+                    if count >= 15:  # Max 15 episodes per query to avoid flood limits
+                        break
+                    b_txt = btn.text or ""
+
+                    if any(nav in b_txt.lower() for nav in ["next", "back", "close", "page"]):
                         continue
 
-                    # Avoid clicking duplicate episode qualities in the same row
-                    ep_match = re.search(r"\b(E\d{1,3})\b", b_text, re.I)
-                    ep_key = ep_match.group(1).upper() if ep_match else b_text
+                    # Extract episode number (e.g. E01, E02)
+                    ep_match = re.search(r"\b(E\d{1,3})\b", b_txt, re.I)
+                    ep_key = f"{msg_id}_{ep_match.group(1).upper()}" if ep_match else f"{msg_id}_{b_txt}"
 
-                    if ep_key in clicked_episodes:
+                    # Skip duplicate buttons on the same grid
+                    if ep_key in CLICKED_EPISODES:
                         continue
+                    CLICKED_EPISODES.add(ep_key)
 
-                    clicked_episodes.add(ep_key)
-                    print(f"📥 Triggering Episode Button: {b_text}")
-
+                    print(f"📥 Clicking Episode -> {b_txt}")
                     try:
-                        # Deep-link button
-                        if getattr(btn, "url", None) and "t.me/" in btn.url and "start=" in btn.url:
+                        # Deep-link start parameter
+                        if getattr(btn, "url", None) and "start=" in btn.url:
                             parsed_url = urlparse(btn.url)
                             bot_uname = parsed_url.path.strip("/")
                             start_param = parse_qs(parsed_url.query).get("start", [""])[0]
                             if bot_uname and start_param:
                                 await client.send_message(bot_uname, f"/start {start_param}")
-                                total_triggered += 1
+                                count += 1
                                 await asyncio.sleep(2.5)
-
-                        # Callback inline button
                         elif getattr(btn, "data", None):
                             await btn.click()
-                            total_triggered += 1
+                            count += 1
                             await asyncio.sleep(2.5)
-
                     except Exception as err:
-                        print(f"⚠️ Episode click error: {err}")
+                        print(f"⚠️ Click error: {err}")
 
-    except Exception as e:
-        print(f"⚠️ Navigation sequence error: {e}")
+    finally:
+        await asyncio.sleep(1)
+        PROCESSING_MSGS.discard(msg_id)
 
-    return total_triggered
-
-# ============================================================
-# 5. MANUAL TRIGGER: Type .get <Name> in Telegram Saved Messages
-# ============================================================
+# ============================================================================
+# 4. MANUAL & CLOUDFLARE TRIGGERS
+# ============================================================================
 @client.on(events.NewMessage(outgoing=True, pattern=r"^\.get\s+(.+)"))
 async def manual_get_command(event):
     query = event.pattern_match.group(1).strip()
-    await event.edit(f"⏳ <b>Navigating @{SOURCE_BOT} for:</b> <code>{query}</code>...", parse_mode="html")
-    count = await pull_movie_from_fileserver(query)
-    await event.edit(f"✅ Triggered <b>{count}</b> episode files for <b>{query}</b>!", parse_mode="html")
+    CLICKED_EPISODES.clear()
+    await event.edit(f"⏳ <b>Auto-pulling:</b> <code>{query}</code>...", parse_mode="html")
+    await client.send_message(SOURCE_BOT, query)
 
-# ============================================================
-# 6. CLOUDFLARE QUEUE POLLER (/get commands)
-# ============================================================
 async def poll_cloudflare_worker():
     headers = {"x-userbot-secret": USERBOT_SECRET}
     async with aiohttp.ClientSession(headers=headers) as session:
@@ -262,28 +245,25 @@ async def poll_cloudflare_worker():
                     if resp.status == 200:
                         data = await resp.json()
                         for job in data.get("jobs", []):
-                            count = await pull_movie_from_fileserver(job["query"])
+                            CLICKED_EPISODES.clear()
+                            await client.send_message(SOURCE_BOT, job["query"])
                             await session.post(f"{WORKER_URL}/api/userbot/jobs", json={
                                 "action": "complete",
                                 "id": job["id"],
-                                "status": "done" if count > 0 else "not_found",
-                                "found_count": count,
+                                "status": "done",
+                                "found_count": 1,
                                 "chat_id": job.get("chat_id"),
-                                "notify_text": f"✅ <b>Finished downloading:</b> <code>{job['query']}</code> ({count} episodes triggered)."
+                                "notify_text": f"🚀 <b>Autopilot triggered for:</b> <code>{job['query']}</code>"
                             })
             except Exception:
                 pass
             await asyncio.sleep(6)
 
 # ============================================================
-# 7. RENDER HEALTH CHECK SERVER
+# 5. RENDER HEALTH CHECK SERVER & ENTRYPOINT
 # ============================================================
 async def handle_ping(request):
-    return web.json_response({
-        "status": "online",
-        "service": "The Backroom Userbot Bridge",
-        "worker_connected": WORKER_URL
-    })
+    return web.json_response({"status": "online", "service": "Autopilot Bridge"})
 
 async def start_health_server():
     app = web.Application()
@@ -293,21 +273,17 @@ async def start_health_server():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    print(f"🌐 HTTP Health Check Server running on port {PORT}")
+    print(f"🌐 HTTP Health Server listening on port {PORT}")
 
-# ============================================================
-# 8. MAIN ENTRYPOINT
-# ============================================================
 async def main():
     await start_health_server()
-
     if not SESSION_STRING:
-        print("❌ ERROR: SESSION_STRING environment variable is missing in Render!")
+        print("❌ ERROR: SESSION_STRING missing in Render!")
         return
 
     await client.start()
-    print("🚀 Telethon Userbot is running and connected!")
-    print(f"📡 Forwarding files from @{SOURCE_BOT} -> {TARGET_DESTINATION}")
+    print("🚀 Autopilot Userbot is live and monitoring @fileserverxrobot!")
+    print(f"📡 Media destination: {TARGET_DESTINATION}")
 
     asyncio.create_task(poll_cloudflare_worker())
     await client.run_until_disconnected()
