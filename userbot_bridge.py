@@ -58,6 +58,15 @@ CATEGORY_EMOJIS = {
     "animation": "🧸", "upcoming": "🔔", "turkish": "🇹🇷", "other": "🎬"
 }
 
+TMDB_GENRE_MAP = {
+    28: "Action", 12: "Adventure", 16: "Animation", 35: "Comedy",
+    80: "Crime", 99: "Documentary", 18: "Drama", 10751: "Family",
+    14: "Fantasy", 36: "History", 27: "Horror", 10402: "Music",
+    9648: "Mystery", 10749: "Romance", 878: "Sci-Fi", 53: "Thriller",
+    10752: "War", 37: "Western", 10759: "Action & Adventure",
+    10765: "Sci-Fi & Fantasy"
+}
+
 INLINE_BUTTONS = [
     [
         Button.url("Series ↗", "https://t.me/thebackroomseries"),
@@ -76,7 +85,7 @@ GREEN_BOT_API_MARKUP = {
     ]
 }
 
-TARGET_RESOLUTIONS = ["360P", "480P", "720P", "1080P", "2160P"]
+TARGET_RESOLUTIONS = ["1080P", "720P", "480P", "360P", "2160P"]
 INDIAN_LANG_CODES = {"hi", "te", "ta", "ml", "kn", "bn", "mr", "pa", "gu", "ur"}
 
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH, loop=loop)
@@ -94,17 +103,23 @@ SKIP_CURRENT_TITLE = False
 ME_USER_ID = None
 
 ACTIVE_CLEAN_TITLE = ""
+ACTIVE_TARGET_YEAR = None
 ACTIVE_SEASON_TAG = "S01"
 ACTIVE_EP_TAG = ""
 ACTIVE_RES_TAG = ""
 
 # ============================================================================
-# 2. NATURAL LANGUAGE COMMAND PARSER (RANGES, MISSING MODE, BULK LISTS)
+# 2. STRICT TITLE, YEAR & NATURAL LANGUAGE COMMAND PARSER
 # ============================================================================
+def extract_year_from_text(text: str):
+    """Extracts a 4-digit release year (1950-2035) if present in text."""
+    m = re.search(r"\b(19[5-9]\d|20[0-3]\d)\b", text or "")
+    return int(m.group(1)) if m else None
+
 def normalize_title_key(title: str) -> str:
-    clean = re.sub(r"\(\d{4}\)|\[\d{4}\]", "", title or "")
+    clean = re.sub(r"\(\d{4}\)|\[\d{4}\]|\b(19[5-9]\d|20[0-3]\d)\b", "", title or "")
     clean = re.sub(
-        r"\b(S\d{1,2}|Season\s*\d+|E\d{1,3}|EP\.?\s*\d+|Episode\s*\d+|360p|480p|540p|720p|1080p|1440p|2160p|4K|BluRay|WEB-?DL|WEBRip|HDRip|Pahe|MKV|MP4|HEVC|x265|x264|10Bit|AAC|DDP\d?\.\d?|ESub|Dual\s*Audio|Multi\s*Audio)\b.*$",
+        r"\b(S\d{1,2}|Season\s*\d+|E\d{1,3}|EP\.?\s*\d+|Episode\s*\d+|360p|480p|540p|720p|1080p|1440p|2160p|4K|BluRay|WEB-?DL|WEBRip|HDRip|Pahe|MKV|MP4|HEVC|x265|x264|10Bit|6CH|8CH|AAC|DDP\d?\.\d?|ESub|Dual\s*Audio|Multi\s*Audio|PSA)\b.*$",
         "",
         clean,
         flags=re.I
@@ -112,13 +127,42 @@ def normalize_title_key(title: str) -> str:
     clean = re.sub(r"[^a-zA-Z0-9]+", " ", clean).strip().lower()
     return clean or "unknown"
 
+def is_strict_title_and_year_match(candidate_text: str, target_title: str, target_year: int = None) -> bool:
+    """
+    Strictly verifies that:
+    1. Every significant word in target_title appears in candidate_text (handling 'spiderman' vs 'spider man').
+    2. If target_year is specified (e.g. 2026) and candidate_text contains a year, the years MUST match!
+    """
+    cand_years = [int(y) for y in re.findall(r"\b(19[5-9]\d|20[0-3]\d)\b", candidate_text or "")]
+    if target_year and cand_years:
+        if target_year not in cand_years:
+            return False
+
+    norm_target = normalize_title_key(target_title)
+    norm_cand = normalize_title_key(candidate_text)
+    if not norm_target or not norm_cand:
+        return False
+
+    # Compact comparison (handles "spiderman" == "spider man", "bluelock" == "blue lock")
+    compact_target = norm_target.replace(" ", "")
+    compact_cand = norm_cand.replace(" ", "")
+    if compact_target in compact_cand:
+        return True
+
+    # Word-level strict check
+    stop_words = {"the", "a", "an", "of", "and", "in", "to", "for", "part", "movie"}
+    target_words = [w for w in norm_target.split() if w not in stop_words and len(w) > 1]
+    if not target_words:
+        target_words = norm_target.split()
+
+    cand_words = set(norm_cand.split())
+    for tw in target_words:
+        if tw not in cand_words and tw not in compact_cand:
+            return False
+
+    return True
+
 def parse_smart_user_command(raw_text: str) -> dict:
-    """
-    Parses natural language commands such as:
-    - 'missing files from solo leveling' -> mode='missing', title='solo leveling'
-    - 'Solo leveling from S2 ep 4 -5 EP 7' -> mode='range', title='Solo leveling', season=2, episodes={4, 5, 7}
-    - 'Blue Lock' -> mode='normal', title='Blue Lock'
-    """
     text = re.sub(r"^\.get\s+", "", (raw_text or "").strip(), flags=re.I).strip()
     text = re.sub(r"^[\d\-\*\•\.]+\s*", "", text).strip(" ,.;:")
 
@@ -139,7 +183,7 @@ def parse_smart_user_command(raw_text: str) -> dict:
         mode = "missing"
         text = re.sub(r"\b(?:find|check|fill)?\s*missing(?:\s+files?|\s+episodes?|\s+ep|\s+parts?)?\b$", "", text, flags=re.I).strip()
 
-    # 2. Detect Season + Episode Range specifications (e.g. "from S2 ep 4 -5 EP 7")
+    # 2. Detect Season + Episode Range specifications
     tail_match = re.search(
         r"\b(?:from\s+)?(?:(s(?:eason)?\s*0*\d{1,2})\b.*|(?:ep?(?:isode)?\.?\s*0*\d{1,3})\b.*)$",
         text,
@@ -153,16 +197,13 @@ def parse_smart_user_command(raw_text: str) -> dict:
             if s_m:
                 season_num = int(s_m.group(1))
 
-            # Remove the season token before extracting episode numbers/ranges
             ep_str = re.sub(r"\bs(?:eason)?\s*0*\d{1,2}\b", " ", tail_str, flags=re.I)
 
-            # Extract ranges like "ep 4 - 5", "4-7", "ep 2 to 6"
             for r_m in re.finditer(r"(?:ep?(?:isode)?\.?\s*)?0*(\d{1,3})\s*(?:\-|to|–|~)\s*(?:ep?(?:isode)?\.?\s*)?0*(\d{1,3})", ep_str, re.I):
                 start_e, end_e = int(r_m.group(1)), int(r_m.group(2))
                 if start_e <= end_e and (end_e - start_e) <= 200:
                     target_episodes.update(range(start_e, end_e + 1))
 
-            # Extract individual episodes like "EP 7", "ep 9", or comma-separated numbers
             for single_m in re.finditer(r"(?:ep?(?:isode)?\.?\s*)0*(\d{1,3})\b", ep_str, re.I):
                 target_episodes.add(int(single_m.group(1)))
 
@@ -171,22 +212,25 @@ def parse_smart_user_command(raw_text: str) -> dict:
                 if target_episodes and mode != "missing":
                     mode = "range"
 
+    # 3. Extract explicit release year if user provided one (e.g. "Spiderman 2026")
+    target_year = extract_year_from_text(text)
+    clean_search_title = re.sub(r"\(\d{4}\)|\[\d{4}\]|\b(19[5-9]\d|20[0-3]\d)\b", "", text).strip(" ,.-:")
+
     return {
         "raw": raw_text.strip(),
-        "title": text.strip(" ,.") or raw_text.strip(),
+        "title": clean_search_title or text.strip(" ,."),
+        "year": target_year,
         "mode": mode,
         "season": season_num,
         "episodes": sorted(list(target_episodes)) if target_episodes else None
     }
 
 def split_bulk_commands(raw_message: str) -> list:
-    """Splits multi-line and comma-separated titles while preserving episode lists like 'ep 4, 5, 7'."""
     commands = []
     for line in (raw_message or "").splitlines():
         line = line.strip()
         if not line or re.match(r"^[\.\s,]+$", line):
             continue
-        # If the line has a trailing comma or multiple titles separated by commas (without 'ep' numbers)
         if "," in line and not re.search(r"\b(?:ep?|episode|s\d{1,2})\b", line, re.I):
             parts = [p.strip(" .,-") for p in line.split(",") if len(p.strip(" .,-")) >= 2]
             commands.extend(parts)
@@ -197,7 +241,7 @@ def split_bulk_commands(raw_message: str) -> list:
     return commands
 
 # ============================================================================
-# 3. LOCAL DEDUPLICATION DATABASE & SAFE CHANNEL SCANNER
+# 3. CROSS-CHANNEL DEDUPLICATION DATABASE & EXISTING RESOLUTION TRACKER
 # ============================================================================
 def extract_resolution_tag(text: str, default_res: str = "HD") -> str:
     m = re.search(r"\b(360p|480p|540p|720p|1080p|1440p|2160p|4K)\b", text or "", re.I)
@@ -252,6 +296,17 @@ def is_already_in_any_channel(clean_title: str, ep_tag: str, res_tag: str = "ANY
     conn.close()
     return bool(row)
 
+def get_existing_resolutions(clean_title: str, ep_tag: str = "MOVIE") -> set:
+    """Returns all resolutions (e.g. {'720P'}) already stored for this movie/episode."""
+    t_key = normalize_title_key(clean_title)
+    conn = sqlite3.connect("storage_index.db")
+    rows = conn.execute(
+        "SELECT DISTINCT res_tag FROM indexed_files_v2 WHERE clean_title=? AND ep_tag=?",
+        (t_key, ep_tag.upper().strip())
+    ).fetchall()
+    conn.close()
+    return {r[0].upper() for r in rows}
+
 def get_indexed_episodes_for_title(clean_title: str) -> set:
     t_key = normalize_title_key(clean_title)
     conn = sqlite3.connect("storage_index.db")
@@ -278,7 +333,6 @@ def record_indexed_file(channel_id: int, clean_title: str, ep_tag: str, res_tag:
     conn.close()
 
 async def ensure_dialogs_cached():
-    """Warms up Telethon's entity cache once so PeerChannel(-100...) never fails."""
     global DIALOG_CACHE_READY
     if DIALOG_CACHE_READY:
         return
@@ -288,11 +342,7 @@ async def ensure_dialogs_cached():
     except Exception as e:
         print(f"⚠️ Dialog cache warmup notice: {e}")
 
-async def sync_title_across_all_channels(query: str):
-    """
-    Safely scans relevant storage channels on Telegram for existing posts of this title
-    with pacing so it never triggers FloodWait.
-    """
+async def sync_title_across_all_channels(query: str, target_year: int = None):
     clean_q = normalize_title_key(query)
     if not clean_q or clean_q == "unknown" or clean_q in SYNCED_TITLES:
         return
@@ -300,8 +350,7 @@ async def sync_title_across_all_channels(query: str):
     await ensure_dialogs_cached()
     SYNCED_TITLES.add(clean_q)
 
-    # Prioritize likely channels first to minimize RPC calls
-    meta = await fetch_meta(query)
+    meta = await fetch_meta(query, target_year)
     primary_cat = detect_category(query, "", meta)
     primary_ch = DEFAULT_CHANNELS.get(primary_cat, DEFAULT_CHANNELS["other"])
     channels_to_scan = [primary_ch] + [c for c in ALL_STORAGE_CHANNELS if c != primary_ch]
@@ -314,39 +363,150 @@ async def sync_title_across_all_channels(query: str):
                     continue
                 fn = (msg.file.name if msg.file else "") or ""
                 txt = f"{fn}\n{msg.text or ''}"
-                msg_title = normalize_title_key(extract_real_filename(fn, msg.text or ""))
-                if clean_q not in msg_title and msg_title not in clean_q:
+                real_fn = extract_real_filename(fn, msg.text or "")
+                if not is_strict_title_and_year_match(real_fn, clean_q, target_year):
                     continue
 
                 ep_tag = extract_season_ep_tag(txt, "S01")
                 res_tag = extract_resolution_tag(txt, "HD")
                 record_indexed_file(ch_id, clean_q, ep_tag, res_tag, fn or "existing_post")
                 found_count += 1
-            await asyncio.sleep(0.25)
+            await asyncio.sleep(0.2)
         except FloodWaitError as fw:
             await asyncio.sleep(fw.seconds + 1)
         except Exception:
             pass
 
     if found_count:
-        print(f"✅ Synced {found_count} existing files for '{clean_q}' from storage channels.")
+        existing_res = get_existing_resolutions(clean_q, "MOVIE")
+        print(f"✅ Synced {found_count} existing files for '{clean_q}' (Existing movie resolutions: {existing_res or 'Series/None'}).")
 
 init_storage_db()
 
 # ============================================================================
-# 4. OFFICIAL CATALOG & FRANCHISE RESOLVER (TVMAZE + TMDB + IMDB)
+# 4. OFFICIAL METADATA, PUBLIC NAME, YEAR & GENRE RESOLVER (TMDB + OMDB + IMDB)
 # ============================================================================
-async def fetch_official_catalog(title: str) -> dict:
-    """
-    Queries TVMaze (free, no key needed), TMDB, and IMDb Suggestion API
-    to discover total seasons/episodes or movie franchise sequels.
-    """
+async def fetch_meta(title: str, target_year: int = None):
     clean = normalize_title_key(title)
-    seasons_map = {}      # {1: [1, 2, ...], 2: [1, 2, ...]}
-    franchise_movies = [] # ["John Wick", "John Wick Chapter 2", ...]
+    cache_key = f"{clean}:{target_year or 'any'}"
+    if cache_key in META_CACHE:
+        return META_CACHE[cache_key]
+
+    public_title = title.strip().title()
+    resolved_year = target_year
+    genres_list = []
+    lang = ""
+    runtime = ""
+    rating = ""
+    is_series = bool(re.search(r"\b(S\d{1,2}|Season|E\d{1,3}|EP\.?\s*\d+|Episode)\b", title, re.I))
 
     async with aiohttp.ClientSession() as session:
-        # 1. TVMaze Episode Guide (100% Free, No Key Required, Accurate Episode Lists)
+        # 1. TMDB Search (Supports Year Filtering & Direct Genre ID Mapping)
+        if TMDB_API_KEY:
+            try:
+                url = f"https://api.themoviedb.org/3/search/multi?api_key={TMDB_API_KEY}&query={quote_plus(clean)}"
+                async with session.get(url, timeout=4) as r:
+                    if r.status == 200:
+                        results = (await r.json()).get("results") or []
+                        chosen = None
+                        for item in results:
+                            rel_date = item.get("release_date") or item.get("first_air_date") or ""
+                            item_year = int(rel_date[:4]) if len(rel_date) >= 4 and rel_date[:4].isdigit() else None
+                            if target_year and item_year and item_year != target_year:
+                                continue
+                            chosen = item
+                            resolved_year = item_year or resolved_year
+                            break
+
+                        if not chosen and results and not target_year:
+                            chosen = results[0]
+                            rel_date = chosen.get("release_date") or chosen.get("first_air_date") or ""
+                            if len(rel_date) >= 4 and rel_date[:4].isdigit():
+                                resolved_year = int(rel_date[:4])
+
+                        if chosen:
+                            public_title = chosen.get("title") or chosen.get("name") or public_title
+                            lang = chosen.get("original_language", "")
+                            if chosen.get("media_type") == "tv":
+                                is_series = True
+                            vote = chosen.get("vote_average")
+                            if vote and float(vote) > 0:
+                                rating = f"{float(vote):.1f}/10"
+                            for gid in (chosen.get("genre_ids") or []):
+                                if gid in TMDB_GENRE_MAP:
+                                    genres_list.append(TMDB_GENRE_MAP[gid])
+            except Exception:
+                pass
+
+        # 2. OMDb Lookup (With Optional Year Parameter)
+        if OMDB_API_KEY:
+            try:
+                y_param = f"&y={target_year}" if target_year else ""
+                url = f"https://www.omdbapi.com/?apikey={OMDB_API_KEY}&t={quote_plus(clean)}{y_param}"
+                async with session.get(url, timeout=4) as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        if data.get("Response") == "True":
+                            public_title = data.get("Title") or public_title
+                            y_str = re.search(r"\b(19\d\d|20\d\d)\b", data.get("Year", ""))
+                            if y_str:
+                                resolved_year = resolved_year or int(y_str.group(1))
+                            omdb_genres = [g.strip() for g in (data.get("Genre") or "").split(",") if g.strip() and g.strip() != "N/A"]
+                            for og in omdb_genres:
+                                if og not in genres_list:
+                                    genres_list.append(og)
+                            if data.get("Runtime") and data.get("Runtime") != "N/A":
+                                runtime = data.get("Runtime")
+                            if data.get("imdbRating") and data.get("imdbRating") != "N/A":
+                                rating = f"{data.get('imdbRating')}/10"
+                            if data.get("Type") == "series":
+                                is_series = True
+            except Exception:
+                pass
+
+        # 3. IMDb Free Public Suggestion API Fallback (No Key Needed, Great for 2026 Releases)
+        if not resolved_year or public_title.lower() == clean:
+            try:
+                first_char = clean[0] if clean else "a"
+                imdb_url = f"https://v3.sg.media-imdb.com/suggestion/{first_char}/{quote_plus(clean)}.json"
+                async with session.get(imdb_url, timeout=4) as ir:
+                    if ir.status == 200:
+                        idata = await ir.json()
+                        for item in (idata.get("d") or []):
+                            lbl = item.get("l", "")
+                            iy = item.get("y")
+                            if target_year and iy and int(iy) != target_year:
+                                continue
+                            if is_strict_title_and_year_match(lbl, clean, target_year):
+                                public_title = lbl
+                                if iy:
+                                    resolved_year = int(iy)
+                                q_type = (item.get("q") or "").lower()
+                                if "series" in q_type or "tv" in q_type:
+                                    is_series = True
+                                break
+            except Exception:
+                pass
+
+    result = {
+        "title": clean,
+        "public_title": public_title,
+        "year": resolved_year,
+        "genres": ", ".join(genres_list),
+        "language": lang,
+        "runtime": runtime,
+        "rating": rating,
+        "is_series": is_series
+    }
+    META_CACHE[cache_key] = result
+    return result
+
+async def fetch_official_catalog(title: str) -> dict:
+    clean = normalize_title_key(title)
+    seasons_map = {}
+    franchise_movies = []
+
+    async with aiohttp.ClientSession() as session:
         try:
             url = f"https://api.tvmaze.com/singlesearch/shows?q={quote_plus(clean)}&embed=episodes"
             async with session.get(url, timeout=5) as r:
@@ -354,50 +514,12 @@ async def fetch_official_catalog(title: str) -> dict:
                     data = await r.json()
                     eps = data.get("_embedded", {}).get("episodes", [])
                     for ep in eps:
-                        s_num = ep.get("season")
-                        e_num = ep.get("number")
+                        s_num, e_num = ep.get("season"), ep.get("number")
                         if s_num and e_num:
                             seasons_map.setdefault(int(s_num), []).append(int(e_num))
         except Exception:
             pass
 
-        # 2. TMDB Series / Movie Collection Lookup (if TMDB_API_KEY is configured)
-        if TMDB_API_KEY:
-            try:
-                s_url = f"https://api.themoviedb.org/3/search/multi?api_key={TMDB_API_KEY}&query={quote_plus(clean)}"
-                async with session.get(s_url, timeout=4) as r:
-                    if r.status == 200:
-                        res_list = (await r.json()).get("results") or []
-                        if res_list and res_list[0].get("media_type") == "tv" and not seasons_map:
-                            tv_id = res_list[0]["id"]
-                            tv_url = f"https://api.themoviedb.org/3/tv/{tv_id}?api_key={TMDB_API_KEY}"
-                            async with session.get(tv_url, timeout=4) as tr:
-                                if tr.status == 200:
-                                    tv_data = await tr.json()
-                                    for s_info in tv_data.get("seasons", []):
-                                        sn = s_info.get("season_number", 0)
-                                        ec = s_info.get("episode_count", 0)
-                                        if sn > 0 and ec > 0:
-                                            seasons_map[sn] = list(range(1, ec + 1))
-
-                # Also check TMDB Movie Collections for Movie Franchises
-                c_url = f"https://api.themoviedb.org/3/search/collection?api_key={TMDB_API_KEY}&query={quote_plus(clean)}"
-                async with session.get(c_url, timeout=4) as cr:
-                    if cr.status == 200:
-                        c_results = (await cr.json()).get("results") or []
-                        if c_results:
-                            col_id = c_results[0]["id"]
-                            col_url = f"https://api.themoviedb.org/3/collection/{col_id}?api_key={TMDB_API_KEY}"
-                            async with session.get(col_url, timeout=4) as d_resp:
-                                if d_resp.status == 200:
-                                    parts = (await d_resp.json()).get("parts") or []
-                                    for p in parts:
-                                        if p.get("title"):
-                                            franchise_movies.append(p["title"])
-            except Exception:
-                pass
-
-        # 3. IMDb Free Public API Fallback for Movie Franchises
         if not seasons_map and not franchise_movies:
             try:
                 first_char = clean[0] if clean else "a"
@@ -413,14 +535,35 @@ async def fetch_official_catalog(title: str) -> dict:
             except Exception:
                 pass
 
-    return {
-        "seasons": seasons_map,
-        "franchise_movies": franchise_movies[:10]
-    }
+    return {"seasons": seasons_map, "franchise_movies": franchise_movies[:10]}
 
 # ============================================================================
-# 5. TECHNICAL SPEC PARSER & CAPTION BUILDER
+# 5. SUBTITLE-SAFE AUDIO PARSER & GENRE-BASED CHANNEL ROUTER
 # ============================================================================
+def strip_subtitle_sections(caption: str) -> str:
+    """
+    Removes Subtitle lines/sections from the bot's caption so subtitle languages
+    (like Korean/Turkish subtitles on an English movie) are NEVER mistaken for Audio!
+    """
+    if not caption:
+        return ""
+    cleaned_lines = []
+    skip_sub_block = False
+
+    for line in caption.splitlines():
+        low = line.strip().lower()
+        # Detect start of a Subtitle section
+        if re.match(r"^(?:💬|📝|🔤)?\s*(?:subtitles?|subs?|esub|mmsub)\s*[:\-]", low) or "subtitles:" in low:
+            skip_sub_block = True
+            continue
+        # If a new non-subtitle section starts (e.g., Audio, Duration, File), stop skipping
+        if skip_sub_block and re.match(r"^(?:🔊|🎬|⏳|📁|\*)?\s*(?:audio|video|duration|size|quality|specs)", low):
+            skip_sub_block = False
+        if not skip_sub_block:
+            cleaned_lines.append(line)
+
+    return "\n".join(cleaned_lines)
+
 def format_size_human(size_bytes: int) -> str:
     if not size_bytes:
         return ""
@@ -438,10 +581,15 @@ def extract_real_filename(filename="", caption=""):
         fn = str(filename or "Media.mkv").strip()
     return re.sub(r"https?://\S+|t\.me/\S+|@[A-Za-z0-9_]+", "", fn).strip()
 
-def extract_tech_specs(filename="", caption="", file_size_bytes=0):
+def extract_tech_specs(filename="", caption="", file_size_bytes=0, meta=None):
+    meta = meta or {}
     real_fn = extract_real_filename(filename, caption)
-    combined = f"{real_fn}\n{caption or ''}"
-    qual = extract_resolution_tag(combined, ACTIVE_RES_TAG or "1080P")
+    # Strip subtitle sections BEFORE checking for audio languages!
+    audio_safe_caption = strip_subtitle_sections(caption or "")
+    combined_safe = f"{real_fn}\n{audio_safe_caption}"
+    full_combined = f"{real_fn}\n{caption or ''}"
+
+    qual = extract_resolution_tag(full_combined, ACTIVE_RES_TAG or "1080P")
 
     source = ""
     for pat, label in [
@@ -452,39 +600,38 @@ def extract_tech_specs(filename="", caption="", file_size_bytes=0):
         (r"\bamzn\b", "AMZN"),
         (r"\bnf|netflix\b", "NF")
     ]:
-        if re.search(pat, combined, re.I):
+        if re.search(pat, full_combined, re.I):
             source = label
             break
 
     codec = "x264"
-    if re.search(r"\b(x265|h265|hevc)\b", combined, re.I):
+    if re.search(r"\b(x265|h265|hevc)\b", full_combined, re.I):
         codec = "HEVC x265"
-    elif re.search(r"\bav1\b", combined, re.I):
+    elif re.search(r"\bav1\b", full_combined, re.I):
         codec = "AV1"
-    if re.search(r"\b10\s*-?bit\b", combined, re.I) and "10-Bit" not in codec:
+    if re.search(r"\b10\s*-?bit\b", full_combined, re.I) and "10-Bit" not in codec:
         codec += " 10-Bit"
 
     aud_codec = "AAC 2.0"
-    if re.search(r"\bddp\s*5\.1\b", combined, re.I):
-        aud_codec = "DDP 5.1"
-    elif re.search(r"\bddp\s*2\.0\b", combined, re.I):
+    if re.search(r"\b6ch\b|\bddp\s*5\.1\b|\b5\.1\b", full_combined, re.I):
+        aud_codec = "DDP 5.1 (6CH)"
+    elif re.search(r"\bddp\s*2\.0\b", full_combined, re.I):
         aud_codec = "DDP 2.0"
 
-    br_m = re.search(r"Video\s*Bitrate\s*:\s*([^\r\n]+)", combined, re.I) or re.search(r"\b(\d{3,5}\s*kbps)\b", combined, re.I)
+    br_m = re.search(r"Video\s*Bitrate\s*:\s*([^\r\n]+)", full_combined, re.I) or re.search(r"\b(\d{3,5}\s*kbps)\b", full_combined, re.I)
     bitrate = br_m.group(1).strip() if br_m else ""
 
-    dur_m = re.search(r"Duration\s*:\s*([^\r\n]+)", combined, re.I) or re.search(r"⏳\s*(\d{1,2}:\d{2}(?::\d{2})?)", combined)
+    dur_m = re.search(r"Duration\s*:\s*([^\r\n]+)", full_combined, re.I) or re.search(r"⏳\s*(\d{1,2}:\d{2}(?::\d{2})?)", full_combined)
     duration = dur_m.group(1).strip() if dur_m else ""
 
-    for_tv = bool(re.search(r"Can\s*be\s*played\s*on\s*TV|FOR\s*TV", combined, re.I) or "x264" in codec)
-    has_sub = bool(re.search(r"Has\s*[a-zA-Z]*\s*subtitles|\b(?:sub|subs|esub|multisub|mmsub)\b|\.mkv\b", combined, re.I))
+    for_tv = bool(re.search(r"Can\s*be\s*played\s*on\s*TV|FOR\s*TV", full_combined, re.I) or "x264" in codec)
+    has_sub = bool(re.search(r"Has\s*[a-zA-Z]*\s*subtitles|\b(?:sub|subs|esub|multisub|mmsub)\b|\.mkv\b", full_combined, re.I))
 
-    audio_lines = []
-    aud_section = re.search(r"Audio\s*List\s*:\s*((?:\r?\n\s*\*[^\r\n]+)+)", caption or "", re.I)
-    if aud_section:
-        for ln in aud_section.group(1).splitlines():
-            if ln.strip().startswith("*"):
-                audio_lines.append(ln.strip())
+    # Only detect audio languages from filename, explicit Audio lines, or TMDB original_language
+    audio_only_text = real_fn
+    for ln in audio_safe_caption.splitlines():
+        if re.search(r"(?:🔊|audio|language|track|\*\s*aac|\*\s*ddp)", ln, re.I):
+            audio_only_text += "\n" + ln
 
     detected_langs = []
     for pat, name in [
@@ -498,21 +645,28 @@ def extract_tech_specs(filename="", caption="", file_size_bytes=0):
         (r"\b(?:turkish|tur)\b", "Turkish"),
         (r"\b(?:amharic|amh|ትርጉም)\b", "Amharic")
     ]:
-        if re.search(pat, combined, re.I):
+        if re.search(pat, audio_only_text, re.I):
             detected_langs.append(name)
 
-    if not audio_lines:
-        if detected_langs:
-            for lang_name in detected_langs:
-                audio_lines.append(f"* {aud_codec} — {lang_name}")
-        else:
-            audio_lines = [f"* {aud_codec} — Original Audio"]
+    # Fallback to Official Original Language from TMDB/OMDb if filename didn't state audio language
+    if not detected_langs:
+        orig_lang_map = {
+            "en": "English", "ja": "Japanese", "ko": "Korean", "hi": "Hindi",
+            "tr": "Turkish", "am": "Amharic", "ta": "Tamil", "te": "Telugu",
+            "ml": "Malayalam", "es": "Spanish", "fr": "French", "zh": "Chinese"
+        }
+        mapped = orig_lang_map.get((meta.get("language") or "").lower(), "English")
+        detected_langs.append(mapped)
+
+    audio_lines = [f"* {aud_codec} — {lang_name}" for lang_name in detected_langs]
 
     audio_mode = ""
-    if len(detected_langs) >= 3 or re.search(r"\bmulti\s*audio\b", combined, re.I):
-        audio_mode = f"Multi Audio ({', '.join(detected_langs[:4])})" if detected_langs else "Multi Audio"
-    elif len(detected_langs) == 2 or re.search(r"\bdual\s*audio\b", combined, re.I):
-        audio_mode = f"Dual Audio ({' + '.join(detected_langs)})" if detected_langs else "Dual Audio"
+    if len(detected_langs) >= 3 or re.search(r"\bmulti\s*audio\b", audio_only_text, re.I):
+        audio_mode = f"Multi Audio ({', '.join(detected_langs[:4])})"
+    elif len(detected_langs) == 2 or re.search(r"\bdual\s*audio\b", audio_only_text, re.I):
+        audio_mode = f"Dual Audio ({' + '.join(detected_langs)})"
+    elif detected_langs:
+        audio_mode = f"{detected_langs[0]} ({aud_codec})"
 
     return {
         "real_filename": real_fn,
@@ -525,17 +679,36 @@ def extract_tech_specs(filename="", caption="", file_size_bytes=0):
         "bitrate": bitrate,
         "for_tv": for_tv,
         "has_sub": has_sub,
-        "audio_lines": audio_lines
+        "audio_lines": audio_lines,
+        "detected_langs": detected_langs
     }
 
-def build_final_caption(filename, caption, meta_runtime="", file_size_bytes=0):
-    sp = extract_tech_specs(filename, caption, file_size_bytes)
-    dur = sp["duration"] or meta_runtime
+def build_final_caption(filename, caption, meta=None, file_size_bytes=0, ep_tag="MOVIE"):
+    meta = meta or {}
+    sp = extract_tech_specs(filename, caption, file_size_bytes, meta)
+    dur = sp["duration"] or meta.get("runtime", "")
+
+    pub_title = meta.get("public_title") or normalize_title_key(filename).title()
+    pub_year = meta.get("year") or extract_year_from_text(filename)
+    year_str = f" ({pub_year})" if pub_year and str(pub_year) not in pub_title else ""
+    ep_str = f" • {ep_tag}" if ep_tag and ep_tag != "MOVIE" else ""
+
+    # Clean Public Display Filename using official title + year + specs
+    clean_public_file = f"{pub_title}{year_str}{ep_str} [{sp['quality']} {sp['source']} {sp['codec']}].mkv".replace("  ", " ")
 
     lines = [
-        "<b>File Name:</b>",
-        f"<code>{sp['real_filename']}</code>"
+        f"🎬 <b>Title:</b> <code>{pub_title}{year_str}{ep_str}</code>"
     ]
+    if meta.get("genres") or meta.get("rating"):
+        g_part = f"🎭 <b>Genre:</b> {meta['genres']}" if meta.get("genres") else ""
+        r_part = f"⭐ <b>{meta['rating']}</b>" if meta.get("rating") else ""
+        lines.append(" • ".join(p for p in [g_part, r_part] if p))
+
+    lines.extend([
+        "",
+        "<b>File Name:</b>",
+        f"<code>{clean_public_file}</code>"
+    ])
 
     tech = []
     if dur:
@@ -574,80 +747,48 @@ def build_final_caption(filename, caption, meta_runtime="", file_size_bytes=0):
 
     return "\n".join(lines)
 
-# ============================================================================
-# 6. METADATA & CATEGORY ENGINE + GREEN INLINE BUTTON PUBLISHER
-# ============================================================================
-async def fetch_meta(title):
-    clean = normalize_title_key(title)
-    if clean in META_CACHE:
-        return META_CACHE[clean]
-
-    genres, lang, runtime = "", "", ""
-    is_series = bool(re.search(r"\b(S\d{1,2}|Season|E\d{1,3}|EP\.?\s*\d+|Episode)\b", title, re.I))
-
-    async with aiohttp.ClientSession() as session:
-        if TMDB_API_KEY:
-            try:
-                url = f"https://api.themoviedb.org/3/search/multi?api_key={TMDB_API_KEY}&query={quote_plus(clean)}"
-                async with session.get(url, timeout=3) as r:
-                    if r.status == 200:
-                        data = await r.json()
-                        res = (data.get("results") or [{}])[0]
-                        lang = res.get("original_language", "")
-                        if res.get("media_type") == "tv":
-                            is_series = True
-            except Exception:
-                pass
-
-        if OMDB_API_KEY:
-            try:
-                url = f"https://www.omdbapi.com/?apikey={OMDB_API_KEY}&t={quote_plus(clean)}"
-                async with session.get(url, timeout=3) as r:
-                    if r.status == 200:
-                        data = await r.json()
-                        if data.get("Response") == "True":
-                            genres = data.get("Genre", "")
-                            runtime = data.get("Runtime", "")
-                            if data.get("Type") == "series":
-                                is_series = True
-            except Exception:
-                pass
-
-    result = {"title": clean, "genres": genres, "language": lang, "runtime": runtime, "is_series": is_series}
-    META_CACHE[clean] = result
-    return result
-
 def detect_category(filename, caption, meta):
-    combined = f"{filename} {caption} {meta.get('genres', '')}".lower()
+    """
+    Routes files strictly using Official TMDB/OMDb Genres & Original Language + Filename
+    (NEVER using the caption's subtitle list!).
+    """
+    meta = meta or {}
+    genres_low = (meta.get("genres") or "").lower()
     lang = (meta.get("language") or "").lower()
+    fn_low = (filename or "").lower()
 
-    if re.search(r"\b(anime|demon slayer|solo leveling|jujutsu|naruto|one piece|bleach|attack on titan|kimetsu|blue lock)\b", combined) or (
-        "animation" in meta.get("genres", "").lower() and lang in ("ja", "zh")
+    # 1. Anime check
+    if re.search(r"\b(anime|demon slayer|solo leveling|jujutsu|naruto|one piece|bleach|attack on titan|kimetsu|blue lock)\b", f"{fn_low} {meta.get('public_title', '').lower()}") or (
+        "animation" in genres_low and lang in ("ja", "zh")
     ):
         return "anime"
 
-    if "animation" in meta.get("genres", "").lower():
+    # 2. Animation check
+    if "animation" in genres_low:
         return "animation"
 
-    if meta.get("is_series") or re.search(r"\b(S\d{1,2}\s*E\d{1,3}|Season\s*\d+|Episode\s*\d+|EP\.?\s*\d+)\b", combined):
+    # 3. Series check
+    if meta.get("is_series") or re.search(r"\b(S\d{1,2}\s*E\d{1,3}|Season\s*\d+|Episode\s*\d+|EP\.?\s*\d+)\b", fn_low, re.I):
         return "series"
 
-    if lang == "am" or re.search(r"[\u1200-\u137F]+|amharic|ትርጉም", combined):
+    # 4. Regional Languages (Strictly from Official Original Language or Filename, NOT Subtitles!)
+    if lang == "am" or re.search(r"[\u1200-\u137F]+|amharic|ትርጉም", fn_low):
         return "amharic"
 
-    if lang in INDIAN_LANG_CODES or re.search(r"\b(hindi|bollywood|telugu|tamil|malayalam)\b", combined):
+    if lang in INDIAN_LANG_CODES or re.search(r"\b(hindi|bollywood|telugu|tamil|malayalam)\b", fn_low):
         return "hindi"
 
-    if lang == "ko" or "korean" in combined:
+    if lang == "ko" or re.search(r"\b(korean|k-drama)\b", fn_low):
         return "korean"
 
-    if lang == "tr" or "turkish" in combined:
+    if lang == "tr" or re.search(r"\bturkish\b", fn_low):
         return "turkish"
 
-    if "horror" in meta.get("genres", "").lower() or "thriller" in meta.get("genres", "").lower():
+    # 5. Movie Genre Routing (Horror / Action / English)
+    if "horror" in genres_low or "thriller" in genres_low:
         return "horror"
 
-    if "action" in meta.get("genres", "").lower() or "adventure" in meta.get("genres", "").lower():
+    if any(g in genres_low for g in ["action", "adventure", "war", "sci-fi"]):
         return "action"
 
     return "english"
@@ -688,9 +829,14 @@ async def publish_file_with_green_buttons(dest_channel: int, media, final_captio
     return sent_msg
 
 # ============================================================================
-# 7. BUTTON SCORING & NAVIGATION HELPERS
+# 6. DEEP MULTI-PAGE BUTTON SCORING (STRICT TITLE/YEAR & MULTI-RESOLUTION)
 # ============================================================================
-def select_best_title_button(buttons, query: str):
+def find_strict_title_button_on_page(buttons, query: str, target_year: int = None):
+    """
+    Finds a button on the current Title Selection page that strictly matches
+    both the title words and target_year (if a year is present).
+    Returns None if no strict match exists on this page (so the bot clicks Next ⏩).
+    """
     clean_q = normalize_title_key(query)
     candidates = []
 
@@ -698,29 +844,36 @@ def select_best_title_button(buttons, query: str):
         for btn in row:
             txt = (btn.text or "").strip()
             low = txt.lower()
-            if any(skip in low for skip in ["back", "close", "next", "page"]):
+            if any(skip in low for skip in ["back", "close", "next", "page", "⏩", "⏪"]):
                 continue
 
-            score = 0
+            if not is_strict_title_and_year_match(txt, query, target_year):
+                continue
+
+            score = 100
             btn_clean = normalize_title_key(txt)
             if btn_clean == clean_q:
                 score += 500
-            elif clean_q in btn_clean:
+            elif btn_clean.startswith(clean_q):
                 score += 300
 
+            # Bonus if explicit target_year is visibly confirmed in the button text
+            if target_year and str(target_year) in txt:
+                score += 400
+
             if "📺" in txt or "season" in low:
-                score += 250
+                score += 200
             elif "🎬" in txt and not re.search(r"\b\d{2}\s*mkv\b", low):
                 score += 150
             if re.search(r"\b\d{2}\s*mkv\b", low):
-                score -= 200
+                score -= 150
 
             candidates.append((score, btn))
 
     if candidates:
         candidates.sort(key=lambda x: x[0], reverse=True)
         return candidates[0][1]
-    return buttons[0][0]
+    return None
 
 def score_quality_button(text: str) -> int:
     t = text.upper()
@@ -731,7 +884,8 @@ def score_quality_button(text: str) -> int:
     elif "480P" in t: score += 400
     elif "360P" in t: score += 200
 
-    if "MULTI" in t or "DUAL" in t: score += 250
+    # High priority for Multi-Audio / Dual-Audio options
+    if "MULTI" in t or "DUAL" in t: score += 350
     if "BLURAY" in t or "BD" in t: score += 200
     elif "WEB-DL" in t: score += 150
     elif "HDRIP" in t: score += 120
@@ -746,7 +900,7 @@ def collect_resolution_quality_buttons(buttons):
         for btn in row:
             txt = (btn.text or "").strip()
             low = txt.lower()
-            if any(skip in low for skip in ["back", "close", "next", "page"]):
+            if any(skip in low for skip in ["back", "close", "next", "page", "⏩", "⏪"]):
                 continue
             s = score_quality_button(txt)
             if s <= 0:
@@ -773,6 +927,9 @@ def parse_size_mb(text: str) -> float:
         return val / 1024.0
     return val
 
+# ============================================================================
+# 7. CLICK & PAGINATION HELPERS
+# ============================================================================
 async def auto_join_channel(url: str):
     try:
         if "+" in url or "joinchat" in url:
@@ -815,6 +972,16 @@ async def smart_click_button(btn):
     except Exception as e:
         print(f"⚠️ Button click notice: {e}")
     return True
+
+def get_next_page_button(msg):
+    if not msg or not msg.buttons:
+        return None
+    for row in msg.buttons:
+        for btn in row:
+            txt = (btn.text or "").strip().lower()
+            if "next" in txt or "⏩" in txt or "➡" in txt:
+                return btn
+    return None
 
 def get_menu_signature(msg) -> str:
     if not msg or not msg.buttons:
@@ -863,7 +1030,7 @@ def is_file_or_episode_grid(msg) -> bool:
     return False
 
 # ============================================================================
-# 8. INCOMING MEDIA EVENT
+# 8. INCOMING MEDIA EVENT (STRICT YEAR/TITLE CHECK + PUBLIC CAPTION + GENRE ROUTE)
 # ============================================================================
 @client.on(events.NewMessage(incoming=True))
 async def on_media_arrival(event):
@@ -886,13 +1053,20 @@ async def on_media_arrival(event):
 
     raw_fn = (msg.file.name if msg.file else None) or (msg.text or "Media.mkv").split("\n")[0]
     caption = msg.text or ""
-    combined_text = f"{raw_fn}\n{caption}"
+    real_fn = extract_real_filename(raw_fn, caption)
+    combined_text = f"{real_fn}\n{caption}"
 
-    print(f"📥 Received file: {raw_fn} ({format_size_human(file_size)})")
+    print(f"📥 Received file: {real_fn} ({format_size_human(file_size)})")
 
-    title_for_meta = ACTIVE_CLEAN_TITLE or raw_fn
-    meta = await fetch_meta(title_for_meta)
-    cat = detect_category(raw_fn, caption, meta)
+    # Strict Title & Release Year Verification before uploading!
+    if ACTIVE_CLEAN_TITLE and not is_strict_title_and_year_match(real_fn, ACTIVE_CLEAN_TITLE, ACTIVE_TARGET_YEAR):
+        print(f"🚫 Strict Filter Rejected: '{real_fn}' does not match requested '{ACTIVE_CLEAN_TITLE}' (Year: {ACTIVE_TARGET_YEAR or 'Any'}). Passing!")
+        FILE_COMPLETED_EVENT.set()
+        return
+
+    title_for_meta = ACTIVE_CLEAN_TITLE or real_fn
+    meta = await fetch_meta(title_for_meta, ACTIVE_TARGET_YEAR)
+    cat = detect_category(real_fn, caption, meta)
     dest_channel = DEFAULT_CHANNELS.get(cat, DEFAULT_CHANNELS["other"])
     cat_emoji = CATEGORY_EMOJIS.get(cat, "📁")
 
@@ -901,25 +1075,24 @@ async def on_media_arrival(event):
     title_key = ACTIVE_CLEAN_TITLE or meta["title"]
 
     if is_already_in_any_channel(title_key, ep_tag, res_tag):
-        print(f"⏭️ Duplicate detected ({title_key} • {ep_tag} • {res_tag}) — skipping.")
+        print(f"⏭️ Duplicate detected ({title_key} • {ep_tag} • {res_tag}) — skipping upload.")
         FILE_COMPLETED_EVENT.set()
         return
 
-    final_caption = build_final_caption(raw_fn, caption, meta.get("runtime", ""), file_size)
+    final_caption = build_final_caption(raw_fn, caption, meta, file_size, ep_tag)
 
     try:
         await publish_file_with_green_buttons(dest_channel, msg.media, final_caption)
-        print(f"🚀 Published {title_key.title()} [{ep_tag} • {res_tag}] to {cat_emoji} {cat.upper()}")
+        print(f"🚀 Published {meta['public_title']} [{ep_tag} • {res_tag}] to {cat_emoji} {cat.upper()}")
 
-        record_indexed_file(dest_channel, title_key, ep_tag, res_tag, raw_fn)
+        record_indexed_file(dest_channel, title_key, ep_tag, res_tag, real_fn)
 
         await client.send_message(
             "me",
             f"✅ <b>Published to Storage!</b>\n"
-            f"• <b>Title:</b> <code>{title_key.title()} ({ep_tag} • {res_tag})</code>\n"
-            f"• <b>File:</b> <code>{extract_real_filename(raw_fn, caption)}</code>\n"
-            f"• <b>Size:</b> <code>{format_size_human(file_size)}</code>\n"
-            f"• <b>Channel:</b> {cat_emoji} <code>{cat.upper()}</code>",
+            f"• <b>Public Name:</b> <code>{meta['public_title']} ({meta.get('year') or 'N/A'})</code>\n"
+            f"• <b>Spec:</b> <code>{ep_tag} • {res_tag} ({format_size_human(file_size)})</code>\n"
+            f"• <b>Genre Route:</b> {cat_emoji} <code>{cat.upper()}</code> ({meta.get('genres') or 'General'})",
             parse_mode="HTML"
         )
     except FloodWaitError as fw:
@@ -930,23 +1103,46 @@ async def on_media_arrival(event):
         FILE_COMPLETED_EVENT.set()
 
 # ============================================================================
-# 9. NAVIGATOR & SELECTIVE/MISSING EPISODE DOWNLOADER
+# 9. DEEP MULTI-PAGE NAVIGATOR (CLICKS 'NEXT ⏩' ON TITLE & QUALITY PAGES)
 # ============================================================================
-async def navigate_to_grid(query: str, target_season_num: int = 1, target_res: str = None, send_fresh: bool = True):
+async def navigate_to_grid(
+    query: str,
+    target_season_num: int = 1,
+    target_res: str = None,
+    target_year: int = None,
+    send_fresh: bool = True
+):
+    """
+    Deeply navigates through @fileserverxrobot:
+    - Paginates Title results (Next ⏩) to find a strict Title + Year match.
+    - Paginates Quality pages (Page 1 of 5 ➔ Next ⏩) to find 360P, 480P, 720P, 1080P, or Multi-Audio.
+    """
+    search_str = f"{query} {target_year}".strip() if target_year else query
     if send_fresh:
-        print(f"📨 Querying @{SOURCE_BOT}: '{query}' (Season {target_season_num:02d} • Res: {target_res or 'AUTO'})")
-        await client.send_message(SOURCE_BOT, query)
+        print(f"📨 Querying @{SOURCE_BOT}: '{search_str}' (Season {target_season_num:02d} • Target Res: {target_res or 'ALL'})")
+        await client.send_message(SOURCE_BOT, search_str)
         await asyncio.sleep(2.0)
 
     tracked_menu_id = None
     available_seasons = []
-    available_resolutions = []
+    discovered_resolutions = []
+    retried_without_year = False
+    title_page_tries = 0
+    quality_page_tries = 0
 
-    for _ in range(16):
+    for _ in range(25):
         if SKIP_CURRENT_TITLE:
             break
         msg = await find_latest_menu_message(SOURCE_BOT, tracked_menu_id)
         if not msg or not msg.buttons:
+            # If searching "Title 2026" returned no buttons in the bot, retry once with just "Title"
+            # and still enforce target_year strictly on the button/file results!
+            if target_year and not retried_without_year:
+                retried_without_year = True
+                print(f"🔄 Retrying search with base title '{query}' (while strictly enforcing year {target_year})...")
+                await client.send_message(SOURCE_BOT, query)
+                await asyncio.sleep(2.2)
+                continue
             await asyncio.sleep(1.0)
             continue
 
@@ -974,19 +1170,31 @@ async def navigate_to_grid(query: str, target_season_num: int = 1, target_res: s
                         break
             continue
 
-        # 2. Episode / File Grid Reached
+        # 2. Screen D: File / Episode Grid Reached
         if is_file_or_episode_grid(msg):
-            return msg, available_seasons, available_resolutions
+            return msg, available_seasons, (discovered_resolutions or TARGET_RESOLUTIONS)
 
-        # 3. Title Selection
+        # 3. Screen A: Title Selection (With Strict Year Match & 'Next ⏩' Pagination!)
         if "choose the correct title" in text or "matching results" in text or "search results for" in text:
-            best_title_btn = select_best_title_button(msg.buttons, query)
-            print(f"👉 [Screen 1/Title] Clicking: {best_title_btn.text}")
-            await smart_click_button(best_title_btn)
-            await wait_for_menu_update(SOURCE_BOT, tracked_menu_id, old_sig)
-            continue
+            strict_btn = find_strict_title_button_on_page(msg.buttons, query, target_year)
+            if strict_btn:
+                print(f"👉 [Screen 1/Title] Strict Match Found: '{strict_btn.text}'")
+                await smart_click_button(strict_btn)
+                await wait_for_menu_update(SOURCE_BOT, tracked_menu_id, old_sig)
+                continue
+            else:
+                nxt_btn = get_next_page_button(msg)
+                if nxt_btn and title_page_tries < 5:
+                    title_page_tries += 1
+                    print(f"📄 [Screen 1/Title] Exact match not on page {title_page_tries}, clicking Next ⏩...")
+                    await smart_click_button(nxt_btn)
+                    await wait_for_menu_update(SOURCE_BOT, tracked_menu_id, old_sig)
+                    continue
+                else:
+                    print(f"🚫 Strict Title/Year Check: '{query} ({target_year or 'Any'})' not found on @{SOURCE_BOT}. Passing!")
+                    return None, [], []
 
-        # 4. Season Selection
+        # 4. Screen B: Season Selection
         if "choose the season" in text or any("season" in (b.text or "").lower() for r in msg.buttons for b in r):
             season_btns = {}
             fallback_btn = None
@@ -1004,15 +1212,17 @@ async def navigate_to_grid(query: str, target_season_num: int = 1, target_res: s
 
             available_seasons = sorted(season_btns.keys())
             chosen_btn = season_btns.get(target_season_num) or fallback_btn or msg.buttons[0][0]
-            print(f"👉 [Screen 2/Season] Clicking: {chosen_btn.text}")
+            print(f"👉 [Screen 2/Season] Clicking: '{chosen_btn.text}'")
             await smart_click_button(chosen_btn)
             await wait_for_menu_update(SOURCE_BOT, tracked_menu_id, old_sig)
             continue
 
-        # 5. Quality Selection
+        # 5. Screen C: Quality Selection (Clicks 'Next ⏩' across Quality Pages 1..5 to find target_res!)
         if "select the available quality" in text or "quality" in text:
             res_options = collect_resolution_quality_buttons(msg.buttons)
-            available_resolutions = [r[0] for r in res_options]
+            for r_tag, _, _ in res_options:
+                if r_tag not in discovered_resolutions:
+                    discovered_resolutions.append(r_tag)
 
             chosen_qual_btn = None
             if target_res:
@@ -1021,11 +1231,29 @@ async def navigate_to_grid(query: str, target_season_num: int = 1, target_res: s
                         chosen_qual_btn = r_btn
                         break
 
-            if not chosen_qual_btn and res_options:
-                chosen_qual_btn = res_options[0][2]
+                # If target_res (e.g. 720P, 480P, 360P) is on Page 2..5 of Quality Menu, click Next ⏩!
+                if not chosen_qual_btn:
+                    nxt_qual_btn = get_next_page_button(msg)
+                    if nxt_qual_btn and quality_page_tries < 6:
+                        quality_page_tries += 1
+                        print(f"📄 [Screen 3/Quality] '{target_res}' not on Quality Page {quality_page_tries} — clicking Next ⏩...")
+                        await smart_click_button(nxt_qual_btn)
+                        await wait_for_menu_update(SOURCE_BOT, tracked_menu_id, old_sig)
+                        continue
+                    else:
+                        print(f"⏭️ Resolution '{target_res}' not available across Quality pages.")
+                        return None, available_seasons, discovered_resolutions
+            else:
+                # Pick first resolution not yet in storage if possible
+                for r_tag, _, r_btn in res_options:
+                    if not is_already_in_any_channel(query, "MOVIE", r_tag):
+                        chosen_qual_btn = r_btn
+                        break
+                if not chosen_qual_btn and res_options:
+                    chosen_qual_btn = res_options[0][2]
 
             if chosen_qual_btn:
-                print(f"👉 [Screen 3/Quality] Clicking: {chosen_qual_btn.text}")
+                print(f"👉 [Screen 3/Quality] Clicking: '{chosen_qual_btn.text}'")
                 await smart_click_button(chosen_qual_btn)
                 await wait_for_menu_update(SOURCE_BOT, tracked_menu_id, old_sig)
                 continue
@@ -1034,21 +1262,20 @@ async def navigate_to_grid(query: str, target_season_num: int = 1, target_res: s
 
         await asyncio.sleep(1.0)
 
-    return None, available_seasons, available_resolutions
+    return None, available_seasons, discovered_resolutions
 
+# ============================================================================
+# 10. MULTI-PAGE FILE & EPISODE DOWNLOADER
+# ============================================================================
 async def download_from_grid(
     initial_msg,
     query: str,
     season_num: int,
     active_res: str,
     target_episodes: set = None,
-    only_missing: bool = False
+    only_missing: bool = False,
+    target_year: int = None
 ):
-    """
-    Downloads episodes/movies from the grid.
-    - If target_episodes is set (e.g. {4, 5, 7}), ONLY downloads those episode numbers!
-    - If only_missing is True, skips any episode that already exists in ANY resolution in storage.
-    """
     global ACTIVE_SEASON_TAG, ACTIVE_EP_TAG, ACTIVE_RES_TAG
     ACTIVE_SEASON_TAG = f"S{season_num:02d}"
     ACTIVE_RES_TAG = active_res or "1080P"
@@ -1061,22 +1288,24 @@ async def download_from_grid(
         best_item_map = {}
         item_counts = {}
         item_order = []
-        next_button = None
+        next_button = get_next_page_button(current_msg)
 
         for row in current_msg.buttons:
             for btn in row:
                 txt = (btn.text or "").strip()
                 low = txt.lower()
-                if any(nav in low for nav in ["back", "close", "page"]):
+                if any(nav in low for nav in ["back", "close", "page", "next", "⏩", "⏪"]):
                     continue
-                if "next" in low or "⏩" in txt:
-                    next_button = btn
-                    continue
+
+                # If button text has a year that conflicts with target_year, skip it immediately
+                if target_year:
+                    btn_years = [int(y) for y in re.findall(r"\b(19[5-9]\d|20[0-3]\d)\b", txt)]
+                    if btn_years and target_year not in btn_years:
+                        continue
 
                 ep_m = re.search(r"\b(?:E|EP\.?)0*(\d{1,3})\b", txt, re.I)
                 ep_num = int(ep_m.group(1)) if ep_m else None
                 if ep_num is not None:
-                    # Filter by user's requested episode range/list if specified
                     if remaining_targets is not None and ep_num not in remaining_targets:
                         continue
                     ep_tag = f"{ACTIVE_SEASON_TAG}E{ep_num:02d}"
@@ -1097,13 +1326,12 @@ async def download_from_grid(
                     if size_mb > best_item_map[item_key][0]:
                         best_item_map[item_key] = (size_mb, btn)
 
-        # Page-Boundary Split Protection
         if next_button and len(item_order) >= 2 and remaining_targets is None:
             last_key = item_order[-1]
             last_size = best_item_map[last_key][0]
             prev_sizes = [best_item_map[k][0] for k in item_order[:-1] if best_item_map[k][0] > 0]
             avg_prev = (sum(prev_sizes) / len(prev_sizes)) if prev_sizes else 0
-            if item_counts.get(last_key, 0) == 1 and avg_prev > 0 and last_size < (avg_prev * 0.55):
+            if item_counts.get(last_key, 0) == 1 and avg_prev > 0 and last_size < (avg_prev * 0.55) and last_key[0] != "MOVIE":
                 item_order.pop()
 
         for ep_tag, btn_res, ep_num in item_order:
@@ -1113,7 +1341,7 @@ async def download_from_grid(
 
             check_res = "ANY" if only_missing else btn_res
             if is_already_in_any_channel(ACTIVE_CLEAN_TITLE, ep_tag, check_res):
-                print(f"⏭️ Skipping {ACTIVE_CLEAN_TITLE} [{ep_tag} • {btn_res}] — already in storage.")
+                print(f"⏭️ Already have {ACTIVE_CLEAN_TITLE} [{ep_tag} • {btn_res}] in storage — checking other resolutions/options.")
                 if remaining_targets is not None and ep_num in remaining_targets:
                     remaining_targets.discard(ep_num)
                 continue
@@ -1136,29 +1364,28 @@ async def download_from_grid(
 
             check_msg = await client.get_messages(SOURCE_BOT, ids=menu_msg_id)
             if not check_msg or not check_msg.buttons:
-                recovered_msg, _, _ = await navigate_to_grid(query, season_num, active_res, send_fresh=True)
+                recovered_msg, _, _ = await navigate_to_grid(query, season_num, active_res, target_year, send_fresh=True)
                 if recovered_msg:
                     menu_msg_id = recovered_msg.id
                     current_msg = recovered_msg
                     for _ in range(1, current_page):
-                        nxt = next((b for r in current_msg.buttons for b in r if "next" in (b.text or "").lower() or "⏩" in (b.text or "")), None)
+                        nxt = get_next_page_button(current_msg)
                         if nxt:
                             old_s = get_menu_signature(current_msg)
                             await smart_click_button(nxt)
                             current_msg = await wait_for_menu_update(SOURCE_BOT, menu_msg_id, old_s)
 
-        # Stop immediately if all specifically requested episodes on this season were downloaded
         if remaining_targets is not None and len(remaining_targets) == 0:
-            print(f"🎯 All requested target episodes for {ACTIVE_SEASON_TAG} completed!")
             break
 
         refreshed = await client.get_messages(SOURCE_BOT, ids=menu_msg_id)
         if refreshed and refreshed.buttons:
             current_msg = refreshed
-            next_button = next((b for r in current_msg.buttons for b in r if "next" in (b.text or "").lower() or "⏩" in (b.text or "")), None)
+            next_button = get_next_page_button(current_msg)
 
         if next_button:
             current_page += 1
+            print(f"📄 Clicking Next ⏩ on file grid to load Page {current_page}...")
             old_sig = get_menu_signature(current_msg)
             await smart_click_button(next_button)
             current_msg = await wait_for_menu_update(SOURCE_BOT, menu_msg_id, old_sig)
@@ -1168,22 +1395,17 @@ async def download_from_grid(
             break
 
 # ============================================================================
-# 10. MASTER UNSTOPPABLE QUEUE WORKER & MISSING-FILES AUDITOR
+# 11. MASTER UNSTOPPABLE QUEUE WORKER & MISSING-FILES AUDITOR
 # ============================================================================
 async def execute_missing_audit_and_fill(cmd: dict):
-    """
-    1. Queries IMDb / TVMaze / TMDB for official episodes or movie franchise parts.
-    2. Scans storage channels.
-    3. Reports and downloads ONLY the missing episodes or missing franchise movies.
-    """
     title = cmd["title"]
+    target_year = cmd.get("year")
     clean_t = normalize_title_key(title)
-    await sync_title_across_all_channels(title)
+    await sync_title_across_all_channels(title, target_year)
 
     catalog = await fetch_official_catalog(title)
     existing_eps = get_indexed_episodes_for_title(clean_t)
 
-    # Case A: Movie Franchise (multiple parts/sequels)
     if not catalog["seasons"] and len(catalog["franchise_movies"]) > 1:
         missing_movies = []
         for m_title in catalog["franchise_movies"]:
@@ -1194,15 +1416,14 @@ async def execute_missing_audit_and_fill(cmd: dict):
         await client.send_message(
             "me",
             f"🔎 <b>Franchise Audit:</b> <code>{title.title()}</code>\n"
-            f"• <b>Total Parts Found (IMDb/TMDB):</b> <code>{len(catalog['franchise_movies'])}</code>\n"
-            f"• <b>Missing Parts ({len(missing_movies)}):</b> <code>{', '.join(missing_movies) or 'None! All present.'}</code>",
+            f"• <b>Total Parts Found:</b> <code>{len(catalog['franchise_movies'])}</code>\n"
+            f"• <b>Missing Parts ({len(missing_movies)}):</b> <code>{', '.join(missing_movies) or 'None!'}</code>",
             parse_mode="HTML"
         )
         for m_title in missing_movies:
-            TITLE_QUEUE.appendleft(({"raw": m_title, "title": m_title, "mode": "normal", "season": None, "episodes": None}, True))
+            TITLE_QUEUE.appendleft(({"raw": m_title, "title": m_title, "year": None, "mode": "normal", "season": None, "episodes": None}, True))
         return
 
-    # Case B: Series / Anime Missing Episodes
     missing_by_season = {}
     if catalog["seasons"]:
         for s_num, ep_list in sorted(catalog["seasons"].items()):
@@ -1215,49 +1436,37 @@ async def execute_missing_audit_and_fill(cmd: dict):
 
     if missing_by_season:
         summary = ", ".join(
-            f"S{s:02d} ({len(eps)} missing: E{min(eps):02d}-E{max(eps):02d})"
+            f"S{s:02d} ({len(eps)} missing)"
             for s, eps in sorted(missing_by_season.items())
         )
         await client.send_message(
             "me",
-            f"🔎 <b>Missing Files Audit (IMDb/TVMaze/TMDB):</b> <code>{title.title()}</code>\n"
-            f"• <b>Already in Storage:</b> <code>{len(existing_eps)}</code> episodes\n"
-            f"• <b>Missing Detected:</b> <code>{summary}</code>\n"
-            f"⚡ <i>Filling missing episodes now...</i>",
+            f"🔎 <b>Missing Files Audit:</b> <code>{title.title()}</code>\n"
+            f"• <b>In Storage:</b> <code>{len(existing_eps)}</code> episodes\n"
+            f"• <b>Missing:</b> <code>{summary}</code>\n"
+            f"⚡ <i>Downloading missing episodes now...</i>",
             parse_mode="HTML"
         )
         for s_num, miss_eps in sorted(missing_by_season.items()):
             if SKIP_CURRENT_TITLE:
                 break
-            grid_msg, _, _ = await navigate_to_grid(title, s_num, target_res=None, send_fresh=True)
+            grid_msg, _, _ = await navigate_to_grid(title, s_num, target_res=None, target_year=target_year, send_fresh=True)
             if grid_msg:
-                await download_from_grid(grid_msg, title, s_num, "1080P", target_episodes=miss_eps, only_missing=True)
+                await download_from_grid(grid_msg, title, s_num, "1080P", target_episodes=miss_eps, only_missing=True, target_year=target_year)
     else:
-        # Fallback: Even if external catalog didn't list episodes, scan bot directly and fill any un-indexed episodes
-        await client.send_message(
-            "me",
-            f"🔎 <b>Scanning @{SOURCE_BOT} directly for any missing episodes of:</b> <code>{title.title()}</code>\n"
-            f"• <b>Currently in Storage:</b> <code>{len(existing_eps)}</code> episodes",
-            parse_mode="HTML"
-        )
-        grid_msg, all_seasons, _ = await navigate_to_grid(title, cmd["season"] or 1, target_res=None, send_fresh=True)
+        grid_msg, all_seasons, _ = await navigate_to_grid(title, cmd["season"] or 1, target_res=None, target_year=target_year, send_fresh=True)
         if grid_msg:
             seasons = [cmd["season"]] if cmd["season"] else (all_seasons or [1])
-            await download_from_grid(grid_msg, title, seasons[0], "1080P", only_missing=True)
-            for nxt_s in seasons[1:]:
-                s_grid, _, _ = await navigate_to_grid(title, nxt_s, target_res=None, send_fresh=True)
-                if s_grid:
-                    await download_from_grid(s_grid, title, nxt_s, "1080P", only_missing=True)
+            await download_from_grid(grid_msg, title, seasons[0], "1080P", only_missing=True, target_year=target_year)
 
 async def process_queue():
-    global CURRENT_PIPELINE_ACTIVE, ACTIVE_CLEAN_TITLE, ACTIVE_EP_TAG, ACTIVE_RES_TAG, SKIP_CURRENT_TITLE
+    global CURRENT_PIPELINE_ACTIVE, ACTIVE_CLEAN_TITLE, ACTIVE_TARGET_YEAR, ACTIVE_EP_TAG, ACTIVE_RES_TAG, SKIP_CURRENT_TITLE
     if CURRENT_PIPELINE_ACTIVE:
         return
 
     CURRENT_PIPELINE_ACTIVE = True
     try:
         while TITLE_QUEUE:
-            # Isolated try/except per item so one failure NEVER stops the rest of the queue
             try:
                 SKIP_CURRENT_TITLE = False
                 cmd, send_initial = TITLE_QUEUE.popleft()
@@ -1265,69 +1474,79 @@ async def process_queue():
                     cmd = parse_smart_user_command(cmd)
 
                 query = cmd["title"]
+                target_year = cmd.get("year")
                 ACTIVE_CLEAN_TITLE = normalize_title_key(query)
+                ACTIVE_TARGET_YEAR = target_year
                 ACTIVE_EP_TAG = ""
                 ACTIVE_RES_TAG = ""
 
-                print(f"🎬 Processing: '{query}' | Mode: {cmd['mode']} | Season: {cmd['season']} | Eps: {cmd['episodes']}")
+                print(f"🎬 Starting: '{query}' (Year: {target_year or 'Any'}) | Mode: {cmd['mode']}")
 
                 if cmd["mode"] == "missing":
                     await execute_missing_audit_and_fill(cmd)
                     continue
 
-                await sync_title_across_all_channels(query)
+                await sync_title_across_all_channels(query, target_year)
                 if SKIP_CURRENT_TITLE:
                     continue
 
                 start_season = cmd["season"] or 1
                 target_eps = set(cmd["episodes"]) if cmd["episodes"] else None
 
-                grid_msg, all_seasons, all_resolutions = await navigate_to_grid(
-                    query, start_season, target_res=None, send_fresh=send_initial
+                # Initial deep navigation (paginates Title & Quality menus as needed)
+                grid_msg, all_seasons, _ = await navigate_to_grid(
+                    query, start_season, target_res=None, target_year=target_year, send_fresh=send_initial
                 )
-                if not grid_msg or SKIP_CURRENT_TITLE:
-                    print(f"⚠️ Could not reach file grid for '{query}', continuing to next item...")
+                if not grid_msg:
+                    await client.send_message(
+                        "me",
+                        f"⚠️ <b>Strictly Passed:</b> Exact match for <code>{cmd['raw']}</code> was not found on @{SOURCE_BOT}.",
+                        parse_mode="HTML"
+                    )
                     continue
 
-                # If specific episodes were requested (e.g., "from S2 ep 4 - 5 ep 7"), grab them fast!
                 if target_eps:
-                    first_res = all_resolutions[0] if all_resolutions else "1080P"
                     await download_from_grid(
-                        grid_msg, query, start_season, first_res, target_episodes=target_eps
+                        grid_msg, query, start_season, ACTIVE_RES_TAG or "1080P",
+                        target_episodes=target_eps, target_year=target_year
                     )
                 else:
                     seasons_to_run = [start_season] if cmd["season"] else (all_seasons if all_seasons else [start_season])
-                    resolutions_to_run = all_resolutions if all_resolutions else ["1080P"]
-
                     first_season = seasons_to_run[0]
-                    first_res = resolutions_to_run[0]
-                    await download_from_grid(grid_msg, query, first_season, first_res)
 
-                    for res_tag in resolutions_to_run[1:]:
+                    # Download from first reached grid
+                    await download_from_grid(grid_msg, query, first_season, ACTIVE_RES_TAG or "1080P", target_year=target_year)
+
+                    # Deep Multi-Resolution Hunt: Check all TARGET_RESOLUTIONS (1080P, 720P, 480P, 360P, 2160P)
+                    # clicking Next ⏩ across Quality pages 1..5 to find every resolution not yet in storage!
+                    for res_tag in TARGET_RESOLUTIONS:
                         if SKIP_CURRENT_TITLE:
                             break
-                        await asyncio.sleep(1.5)
-                        res_grid, _, _ = await navigate_to_grid(query, first_season, target_res=res_tag, send_fresh=True)
-                        if res_grid and not SKIP_CURRENT_TITLE:
-                            await download_from_grid(res_grid, query, first_season, res_tag)
+                        if not all_seasons and is_already_in_any_channel(query, "MOVIE", res_tag):
+                            print(f"⏭️ Already have '{query}' in {res_tag} — skipping {res_tag}.")
+                            continue
 
+                        print(f"🔎 Hunting resolution {res_tag} across Quality pages for '{query}'...")
+                        await asyncio.sleep(1.5)
+                        res_grid, _, _ = await navigate_to_grid(
+                            query, first_season, target_res=res_tag, target_year=target_year, send_fresh=True
+                        )
+                        if res_grid and not SKIP_CURRENT_TITLE:
+                            await download_from_grid(res_grid, query, first_season, res_tag, target_year=target_year)
+
+                    # Process remaining seasons (Season 02, 03...) across resolutions
                     for next_s in seasons_to_run[1:]:
                         if SKIP_CURRENT_TITLE or next_s <= first_season:
                             continue
-                        await asyncio.sleep(2.0)
-                        s_grid, _, s_res_list = await navigate_to_grid(query, next_s, target_res=None, send_fresh=True)
-                        if not s_grid or SKIP_CURRENT_TITLE:
-                            continue
-                        s_resolutions = s_res_list if s_res_list else ["1080P"]
-                        await download_from_grid(s_grid, query, next_s, s_resolutions[0])
-
-                        for res_tag in s_resolutions[1:]:
+                        for res_tag in TARGET_RESOLUTIONS:
                             if SKIP_CURRENT_TITLE:
                                 break
                             await asyncio.sleep(1.5)
-                            r_grid, _, _ = await navigate_to_grid(query, next_s, target_res=res_tag, send_fresh=True)
+                            r_grid, _, _ = await navigate_to_grid(
+                                query, next_s, target_res=res_tag, target_year=target_year, send_fresh=True
+                            )
                             if r_grid and not SKIP_CURRENT_TITLE:
-                                await download_from_grid(r_grid, query, next_s, res_tag)
+                                await download_from_grid(r_grid, query, next_s, res_tag, target_year=target_year)
 
                 await client.send_message(
                     "me",
@@ -1341,6 +1560,7 @@ async def process_queue():
                 await asyncio.sleep(2.0)
     finally:
         CURRENT_PIPELINE_ACTIVE = False
+        ACTIVE_TARGET_YEAR = None
         ACTIVE_EP_TAG = ""
         ACTIVE_RES_TAG = ""
 
@@ -1358,13 +1578,13 @@ def enqueue_commands_bulk(raw_text: str, send_initial: bool = True) -> list:
     return parsed_list
 
 # ============================================================================
-# 11. SAVED MESSAGES & SOURCE_BOT TRIGGERS
+# 12. SAVED MESSAGES & SOURCE_BOT TRIGGERS
 # ============================================================================
 @client.on(events.NewMessage(outgoing=True))
 async def on_outgoing_trigger(event):
     global SKIP_CURRENT_TITLE, ME_USER_ID
     text = (event.message.text or "").strip()
-    if not text or text.startswith(("/", "✅", "⏳", "🏁", "⚠️", "🔗", "📋", "🛑", "🔎")):
+    if not text or text.startswith(("/", "✅", "⏳", "🏁", "⚠️", "🔗", "📋", "🛑", "🔎", "🎬")):
         return
 
     if ME_USER_ID is None:
@@ -1380,7 +1600,7 @@ async def on_outgoing_trigger(event):
             ) or "  <i>(Empty)</i>"
             await event.reply(
                 f"📋 <b>Multi-Queue Status</b>\n"
-                f"• <b>Active:</b> <code>{ACTIVE_CLEAN_TITLE or 'Idle'}</code> ({ACTIVE_SEASON_TAG} • {ACTIVE_RES_TAG or '-'})\n"
+                f"• <b>Active:</b> <code>{ACTIVE_CLEAN_TITLE or 'Idle'}</code> (Year: {ACTIVE_TARGET_YEAR or 'Any'} • {ACTIVE_RES_TAG or '-'})\n"
                 f"• <b>Waiting ({len(TITLE_QUEUE)}):</b>\n{q_list}",
                 parse_mode="HTML"
             )
@@ -1402,14 +1622,15 @@ async def on_outgoing_trigger(event):
         if added:
             summary_lines = []
             for c in added[:8]:
+                y_badge = f" [{c['year']}]" if c.get("year") else ""
                 if c["mode"] == "missing":
-                    summary_lines.append(f"• 🔍 <b>Missing Audit:</b> <code>{c['title']}</code>")
+                    summary_lines.append(f"• 🔍 <b>Missing Audit:</b> <code>{c['title']}{y_badge}</code>")
                 elif c["mode"] == "range":
                     s_lbl = f"S{c['season']:02d}" if c["season"] else "S01"
                     e_lbl = ", ".join(f"E{e:02d}" for e in (c["episodes"] or [])[:8])
-                    summary_lines.append(f"• 🎯 <b>Selective:</b> <code>{c['title']}</code> ({s_lbl}: {e_lbl})")
+                    summary_lines.append(f"• 🎯 <b>Selective:</b> <code>{c['title']}{y_badge}</code> ({s_lbl}: {e_lbl})")
                 else:
-                    summary_lines.append(f"• 🎬 <b>Full Sync:</b> <code>{c['title']}</code>")
+                    summary_lines.append(f"• 🎬 <b>Deep Multi-Res Sync:</b> <code>{c['title']}{y_badge}</code>")
 
             if len(added) > 8:
                 summary_lines.append(f"<i>...and +{len(added)-8} more</i>")
@@ -1426,10 +1647,9 @@ async def on_outgoing_trigger(event):
         enqueue_commands_bulk(text, send_initial=False)
 
 # ============================================================================
-# 12. 24/7 KEEP-ALIVE SELF-PING & RENDER HEALTH SERVER
+# 13. 24/7 KEEP-ALIVE SELF-PING & RENDER HEALTH SERVER
 # ============================================================================
 async def keep_alive_worker():
-    """Pings the local/external HTTP server every 10 minutes so Render never sleeps."""
     target_url = RENDER_EXTERNAL_URL or f"http://127.0.0.1:{PORT}/"
     while True:
         await asyncio.sleep(600)
@@ -1446,7 +1666,7 @@ async def handle_ping(request):
         "pipeline_active": CURRENT_PIPELINE_ACTIVE,
         "queue_length": len(TITLE_QUEUE),
         "active_title": ACTIVE_CLEAN_TITLE,
-        "active_season": ACTIVE_SEASON_TAG,
+        "active_year": ACTIVE_TARGET_YEAR,
         "active_resolution": ACTIVE_RES_TAG
     })
 
@@ -1471,7 +1691,7 @@ async def main():
     await ensure_dialogs_cached()
     asyncio.create_task(keep_alive_worker())
 
-    print(f"🚀 Non-Stop Autonomous Media Pipeline is LIVE! Watching @{SOURCE_BOT} and Saved Messages.")
+    print(f"🚀 Deep Multi-Page Media Pipeline LIVE! Watching @{SOURCE_BOT} and Saved Messages.")
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
