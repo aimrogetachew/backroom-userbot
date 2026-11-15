@@ -1,3 +1,5 @@
+
+
 import os
 import re
 import json
@@ -22,7 +24,7 @@ from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
 
 # ============================================================================
-# 1. CONFIGURATION (READ FROM ENVIRONMENT VARIABLES)
+# 1. CONFIGURATION & STORAGE CHANNELS
 # ============================================================================
 API_ID = int(os.environ.get("API_ID", "0"))
 API_HASH = os.environ.get("API_HASH", "")
@@ -98,6 +100,12 @@ DIALOG_CACHE_READY = False
 META_CACHE = {}
 TITLE_QUEUE = deque()
 
+# 24/7 API Rate-Limit Shield Counters
+OMDB_CALL_DAY = ""
+OMDB_CALL_COUNT = 0
+OMDB_DAILY_SAFE_LIMIT = 900
+TMDB_SEMAPHORE = asyncio.Semaphore(3)
+
 CURRENT_PIPELINE_ACTIVE = False
 SKIP_CURRENT_TITLE = False
 AUTO_DISCOVERY_ENABLED = True
@@ -117,14 +125,13 @@ def current_utc_date_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 # ============================================================================
-# 2. CLEAN TITLE & STRICT YEAR PARSER
+# 2. CLEAN TITLE, STRICT YEAR & NATURAL LANGUAGE PARSER
 # ============================================================================
 def extract_year_from_text(text: str):
     m = re.search(r"\b(19[5-9]\d|20[0-3]\d)\b", text or "")
     return int(m.group(1)) if m else None
 
 def normalize_title_key(title: str) -> str:
-    # Remove apostrophes cleanly so "King's" == "Kings" and "Don't" == "Dont"
     s = re.sub(r"['’`]", "", title or "")
     s = re.sub(r"[._\-]+", " ", s).strip()
     s = re.sub(r"^[^\w]+", "", s).strip()
@@ -134,7 +141,7 @@ def normalize_title_key(title: str) -> str:
         s = yr_m.group(1)
 
     s = re.sub(
-        r"\b(S\d{1,2}|Season\s*\d+|E\d{1,3}|EP\.?\s*\d+|Episode\s*\d+|360p|480p|540p|720p|1080p|1440p|2160p|4K|BluRay|WEB-?DL|WEBRip|HDRip|NF|AMZN|DSNP|Pahe|MKV|MP4|HEVC|x265|x264|10Bit|6CH|8CH|AAC\d*|DDP\d*|ESub|Dual\s*Audio|Multi\s*Audio)\b.*$",
+        r"\b(S\d{1,2}|Season\s*\d+|E\d{1,3}|EP\.?\s*\d+|Episode\s*\d+|360p|480p|540p|720p|1080p|1440p|2160p|4K|BluRay|WEB-?DL|WEBRip|HDRip|NF|AMZN|DSNP|Pahe|MKV|MP4|HEVC|x265|x264|10Bit|6CH|8CH|AAC\d*|DDP\d*|ESub|Dual\s*Audio|Multi\s*Audio|Dubbed|Dub)\b.*$",
         "",
         s,
         flags=re.I
@@ -246,7 +253,7 @@ def split_bulk_commands(raw_message: str) -> list:
     return commands
 
 # ============================================================================
-# 3. DATABASE: DEDUPLICATION + REAL-TIME EXPIRING CRAWLER HISTORY
+# 3. DATABASE: DEDUP, AUTO-UPGRADE TRACKER, PERSISTENT META CACHE & CRAWLER
 # ============================================================================
 def extract_resolution_tag(text: str, default_res: str = "HD") -> str:
     m = re.search(r"\b(360p|480p|540p|720p|1080p|1440p|2160p|4K)\b", text or "", re.I)
@@ -254,6 +261,15 @@ def extract_resolution_tag(text: str, default_res: str = "HD") -> str:
         r = m.group(1).upper()
         return "2160P" if r == "4K" else r
     return default_res.upper()
+
+def extract_audio_tier(text: str, num_langs: int = 1) -> int:
+    """3 = Multi-Audio / Dubbed (3+ langs), 2 = Dual Audio (2 langs), 1 = Single Audio."""
+    t = (text or "").lower()
+    if num_langs >= 3 or re.search(r"\b(multi\s*audio|multi\s*dub|dubbed|hin.*eng.*jap|tam.*tel.*hin)\b", t):
+        return 3
+    if num_langs == 2 or re.search(r"\b(dual\s*audio|dual\s*dub|hin[\s\-\+]+eng|eng[\s\-\+]+jap)\b", t):
+        return 2
+    return 1
 
 def extract_season_ep_tag(text: str, default_season: str = "S01") -> str:
     s_m = re.search(r"\b(?:S|Season\s*)0*(\d{1,2})\b", text or "", re.I)
@@ -269,15 +285,24 @@ def init_storage_db():
     now_yr = current_utc_year()
     conn = sqlite3.connect("storage_index.db")
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS indexed_files_v2 (
+        CREATE TABLE IF NOT EXISTS indexed_files_v3 (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             channel_id INTEGER NOT NULL,
+            message_id INTEGER DEFAULT 0,
             clean_title TEXT NOT NULL,
             ep_tag TEXT NOT NULL,
             res_tag TEXT NOT NULL,
+            audio_tier INTEGER DEFAULT 1,
             file_name TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(clean_title, ep_tag, res_tag)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS persistent_meta_cache (
+            cache_key TEXT PRIMARY KEY,
+            json_data TEXT NOT NULL,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
     conn.execute(f"""
@@ -302,6 +327,71 @@ def init_storage_db():
     conn.commit()
     conn.close()
 
+def get_stored_file_record(clean_title: str, ep_tag: str, res_tag: str = "ANY"):
+    """Returns (channel_id, message_id, audio_tier) if stored, else None."""
+    t_key = normalize_title_key(clean_title)
+    e_key = ep_tag.upper().strip()
+    r_key = (res_tag or "ANY").upper().strip()
+    conn = sqlite3.connect("storage_index.db")
+    if r_key != "ANY":
+        row = conn.execute(
+            "SELECT channel_id, message_id, audio_tier FROM indexed_files_v3 WHERE clean_title=? AND ep_tag=? AND res_tag=?",
+            (t_key, e_key, r_key)
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT channel_id, message_id, audio_tier FROM indexed_files_v3 WHERE clean_title=? AND ep_tag=?",
+            (t_key, e_key)
+        ).fetchone()
+    conn.close()
+    return row
+
+def is_already_in_any_channel(clean_title: str, ep_tag: str, res_tag: str = "ANY", min_audio_tier: int = 1) -> bool:
+    row = get_stored_file_record(clean_title, ep_tag, res_tag)
+    if not row:
+        return False
+    _, _, stored_tier = row
+    return (stored_tier or 1) >= min_audio_tier
+
+def record_indexed_file(channel_id: int, message_id: int, clean_title: str, ep_tag: str, res_tag: str, audio_tier: int, file_name: str):
+    conn = sqlite3.connect("storage_index.db")
+    conn.execute(
+        """INSERT OR REPLACE INTO indexed_files_v3
+           (channel_id, message_id, clean_title, ep_tag, res_tag, audio_tier, file_name)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (
+            channel_id,
+            message_id or 0,
+            normalize_title_key(clean_title),
+            ep_tag.upper().strip(),
+            (res_tag or "HD").upper().strip(),
+            int(audio_tier or 1),
+            file_name
+        )
+    )
+    conn.commit()
+    conn.close()
+
+def get_existing_resolutions(clean_title: str, ep_tag: str = "MOVIE") -> set:
+    t_key = normalize_title_key(clean_title)
+    conn = sqlite3.connect("storage_index.db")
+    rows = conn.execute(
+        "SELECT DISTINCT res_tag FROM indexed_files_v3 WHERE clean_title=? AND ep_tag=?",
+        (t_key, ep_tag.upper().strip())
+    ).fetchall()
+    conn.close()
+    return {r[0].upper() for r in rows}
+
+def get_indexed_episodes_for_title(clean_title: str) -> set:
+    t_key = normalize_title_key(clean_title)
+    conn = sqlite3.connect("storage_index.db")
+    rows = conn.execute(
+        "SELECT DISTINCT ep_tag FROM indexed_files_v3 WHERE clean_title=?",
+        (t_key,)
+    ).fetchall()
+    conn.close()
+    return {r[0] for r in rows}
+
 def get_crawler_progress():
     conn = sqlite3.connect("storage_index.db")
     row = conn.execute("SELECT current_year, current_page, media_kind FROM crawler_state WHERE id=1").fetchone()
@@ -315,7 +405,6 @@ def save_crawler_progress(year: int, page: int, media_kind: str):
     conn.close()
 
 def is_title_crawled_recently(clean_title: str, hours: int = 12) -> bool:
-    """Only skips if checked within the last 12 hours so real-time new episodes/upgrades are caught."""
     conn = sqlite3.connect("storage_index.db")
     row = conn.execute(
         f"SELECT 1 FROM crawler_history WHERE clean_title=? AND checked_at >= datetime('now', '-{int(hours)} hours')",
@@ -333,60 +422,6 @@ def mark_title_crawled(clean_title: str, year: int = None):
     conn.commit()
     conn.close()
 
-def is_already_in_any_channel(clean_title: str, ep_tag: str, res_tag: str = "ANY") -> bool:
-    t_key = normalize_title_key(clean_title)
-    e_key = ep_tag.upper().strip()
-    r_key = (res_tag or "ANY").upper().strip()
-
-    conn = sqlite3.connect("storage_index.db")
-    if r_key != "ANY":
-        row = conn.execute(
-            "SELECT channel_id FROM indexed_files_v2 WHERE clean_title=? AND ep_tag=? AND res_tag=?",
-            (t_key, e_key, r_key)
-        ).fetchone()
-    else:
-        row = conn.execute(
-            "SELECT channel_id FROM indexed_files_v2 WHERE clean_title=? AND ep_tag=?",
-            (t_key, e_key)
-        ).fetchone()
-    conn.close()
-    return bool(row)
-
-def get_existing_resolutions(clean_title: str, ep_tag: str = "MOVIE") -> set:
-    t_key = normalize_title_key(clean_title)
-    conn = sqlite3.connect("storage_index.db")
-    rows = conn.execute(
-        "SELECT DISTINCT res_tag FROM indexed_files_v2 WHERE clean_title=? AND ep_tag=?",
-        (t_key, ep_tag.upper().strip())
-    ).fetchall()
-    conn.close()
-    return {r[0].upper() for r in rows}
-
-def get_indexed_episodes_for_title(clean_title: str) -> set:
-    t_key = normalize_title_key(clean_title)
-    conn = sqlite3.connect("storage_index.db")
-    rows = conn.execute(
-        "SELECT DISTINCT ep_tag FROM indexed_files_v2 WHERE clean_title=?",
-        (t_key,)
-    ).fetchall()
-    conn.close()
-    return {r[0] for r in rows}
-
-def record_indexed_file(channel_id: int, clean_title: str, ep_tag: str, res_tag: str, file_name: str):
-    conn = sqlite3.connect("storage_index.db")
-    conn.execute(
-        "INSERT OR IGNORE INTO indexed_files_v2 (channel_id, clean_title, ep_tag, res_tag, file_name) VALUES (?, ?, ?, ?, ?)",
-        (
-            channel_id,
-            normalize_title_key(clean_title),
-            ep_tag.upper().strip(),
-            (res_tag or "HD").upper().strip(),
-            file_name
-        )
-    )
-    conn.commit()
-    conn.close()
-
 async def ensure_dialogs_cached():
     global DIALOG_CACHE_READY
     if DIALOG_CACHE_READY:
@@ -398,6 +433,11 @@ async def ensure_dialogs_cached():
         print(f"⚠️ Dialog cache warmup notice: {e}")
 
 async def sync_title_across_all_channels(query: str, target_year: int = None):
+    """
+    Scans storage channels for existing posts of this title.
+    If an old post is found in the WRONG genre channel or lacks the clean Public Title header,
+    it deletes and readjusts it automatically!
+    """
     clean_q = normalize_title_key(query)
     if not clean_q or clean_q == "unknown" or clean_q in SYNCED_TITLES:
         return
@@ -409,15 +449,15 @@ async def sync_title_across_all_channels(query: str, target_year: int = None):
     pub_clean = normalize_title_key(meta.get("public_title") or query)
     SYNCED_TITLES.add(pub_clean)
 
-    primary_cat = detect_category(query, "", meta)
-    primary_ch = DEFAULT_CHANNELS.get(primary_cat, DEFAULT_CHANNELS["other"])
-    channels_to_scan = [primary_ch] + [c for c in ALL_STORAGE_CHANNELS if c != primary_ch]
+    correct_cat = detect_category(query, "", meta)
+    correct_ch = DEFAULT_CHANNELS.get(correct_cat, DEFAULT_CHANNELS["other"])
+    channels_to_scan = [correct_ch] + [c for c in ALL_STORAGE_CHANNELS if c != correct_ch]
 
     found_count = 0
     for ch_id in channels_to_scan:
         try:
-            async for msg in client.iter_messages(ch_id, search=meta.get("public_title") or clean_q, limit=40):
-                if not (msg.video or msg.document or msg.text):
+            async for msg in client.iter_messages(ch_id, search=meta.get("public_title") or clean_q, limit=35):
+                if not (msg.video or msg.document):
                     continue
                 fn = (msg.file.name if msg.file else "") or ""
                 txt = f"{fn}\n{msg.text or ''}"
@@ -427,8 +467,26 @@ async def sync_title_across_all_channels(query: str, target_year: int = None):
 
                 ep_tag = extract_season_ep_tag(txt, "S01")
                 res_tag = extract_resolution_tag(txt, "HD")
-                record_indexed_file(ch_id, clean_q, ep_tag, res_tag, fn or "existing_post")
-                record_indexed_file(ch_id, pub_clean, ep_tag, res_tag, fn or "existing_post")
+                aud_tier = extract_audio_tier(txt)
+
+                # Auto-Readjust: If old post was in the wrong channel (e.g. Horror movie in Korean channel)
+                # or missing the Public Title header '🎬', move/re-publish it and delete the old one!
+                if ch_id != correct_ch or "🎬" not in (msg.text or ""):
+                    try:
+                        file_sz = msg.file.size if msg.file else 0
+                        new_cap = build_final_caption(fn or real_fn, msg.text or "", meta, file_sz, ep_tag)
+                        new_sent = await publish_file_with_green_buttons(correct_ch, msg.media, new_cap)
+                        await client.delete_messages(ch_id, [msg.id])
+                        new_id = new_sent.id if new_sent else 0
+                        record_indexed_file(correct_ch, new_id, clean_q, ep_tag, res_tag, aud_tier, real_fn)
+                        record_indexed_file(correct_ch, new_id, pub_clean, ep_tag, res_tag, aud_tier, real_fn)
+                        print(f"♻️ Readjusted '{meta.get('public_title')}' [{res_tag}] ➔ moved from {ch_id} to {correct_cat.upper()} ({correct_ch})")
+                        continue
+                    except Exception:
+                        pass
+
+                record_indexed_file(ch_id, msg.id, clean_q, ep_tag, res_tag, aud_tier, real_fn)
+                record_indexed_file(ch_id, msg.id, pub_clean, ep_tag, res_tag, aud_tier, real_fn)
                 found_count += 1
             await asyncio.sleep(0.2)
         except FloodWaitError as fw:
@@ -442,15 +500,42 @@ async def sync_title_across_all_channels(query: str, target_year: int = None):
 init_storage_db()
 
 # ============================================================================
-# 4. POPULAR PUBLISHED TITLE & GENRE ENGINE (TMDB en-US + OMDB + ITUNES + IMDB)
+# 4. 24/7 RATE-LIMIT-PROOF METADATA & POPULAR PUBLIC TITLE ENGINE
 # ============================================================================
+def get_db_cached_meta(cache_key: str):
+    conn = sqlite3.connect("storage_index.db")
+    row = conn.execute("SELECT json_data FROM persistent_meta_cache WHERE cache_key=?", (cache_key,)).fetchone()
+    conn.close()
+    if row:
+        try:
+            return json.loads(row[0])
+        except Exception:
+            pass
+    return None
+
+def save_db_cached_meta(cache_key: str, data: dict):
+    conn = sqlite3.connect("storage_index.db")
+    conn.execute(
+        "INSERT OR REPLACE INTO persistent_meta_cache (cache_key, json_data, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+        (cache_key, json.dumps(data))
+    )
+    conn.commit()
+    conn.close()
+
 async def fetch_meta(title: str, target_year: int = None):
+    global OMDB_CALL_DAY, OMDB_CALL_COUNT
     clean = normalize_title_key(title)
     if not target_year:
         target_year = extract_year_from_text(title)
     cache_key = f"{clean}:{target_year or 'any'}"
+
     if cache_key in META_CACHE:
         return META_CACHE[cache_key]
+
+    db_cached = get_db_cached_meta(cache_key)
+    if db_cached:
+        META_CACHE[cache_key] = db_cached
+        return db_cached
 
     public_title = clean.title()
     original_title = ""
@@ -459,50 +544,59 @@ async def fetch_meta(title: str, target_year: int = None):
     lang = ""
     runtime = ""
     rating = ""
+    collection_id = None
     is_series = bool(re.search(r"\b(S\d{1,2}|Season|E\d{1,3}|EP\.?\s*\d+|Episode)\b", title, re.I))
 
+    today_str = current_utc_date_str()
+    if OMDB_CALL_DAY != today_str:
+        OMDB_CALL_DAY = today_str
+        OMDB_CALL_COUNT = 0
+
     async with aiohttp.ClientSession() as session:
-        # 1. TMDB Search with language=en-US to always get the Official Popular International Published Title
+        # 1. TMDB Search (Paced by Semaphore + language=en-US for Official Popular Title)
         if TMDB_API_KEY:
+            async with TMDB_SEMAPHORE:
+                try:
+                    url = f"https://api.themoviedb.org/3/search/multi?api_key={TMDB_API_KEY}&language=en-US&query={quote_plus(clean)}"
+                    async with session.get(url, timeout=4) as r:
+                        if r.status == 200:
+                            results = (await r.json()).get("results") or []
+                            chosen = None
+                            for item in results:
+                                rel_date = item.get("release_date") or item.get("first_air_date") or ""
+                                item_year = int(rel_date[:4]) if len(rel_date) >= 4 and rel_date[:4].isdigit() else None
+                                if target_year and item_year and item_year != target_year:
+                                    continue
+                                chosen = item
+                                resolved_year = item_year or resolved_year
+                                break
+
+                            if not chosen and results and not target_year:
+                                chosen = results[0]
+                                rel_date = chosen.get("release_date") or chosen.get("first_air_date") or ""
+                                if len(rel_date) >= 4 and rel_date[:4].isdigit():
+                                    resolved_year = int(rel_date[:4])
+
+                            if chosen:
+                                public_title = chosen.get("title") or chosen.get("name") or public_title
+                                original_title = chosen.get("original_title") or chosen.get("original_name") or ""
+                                lang = chosen.get("original_language", "")
+                                if chosen.get("media_type") == "tv":
+                                    is_series = True
+                                vote = chosen.get("vote_average")
+                                if vote and float(vote) > 0:
+                                    rating = f"{float(vote):.1f}/10"
+                                for gid in (chosen.get("genre_ids") or []):
+                                    if gid in TMDB_GENRE_MAP and TMDB_GENRE_MAP[gid] not in genres_list:
+                                        genres_list.append(TMDB_GENRE_MAP[gid])
+                    await asyncio.sleep(0.25)
+                except Exception:
+                    pass
+
+        # 2. OMDb Lookup (Protected by 900/day Governor so Free Key NEVER Hits Limit)
+        if OMDB_API_KEY and OMDB_CALL_COUNT < OMDB_DAILY_SAFE_LIMIT and (not genres_list or not runtime):
             try:
-                url = f"https://api.themoviedb.org/3/search/multi?api_key={TMDB_API_KEY}&language=en-US&query={quote_plus(clean)}"
-                async with session.get(url, timeout=4) as r:
-                    if r.status == 200:
-                        results = (await r.json()).get("results") or []
-                        chosen = None
-                        for item in results:
-                            rel_date = item.get("release_date") or item.get("first_air_date") or ""
-                            item_year = int(rel_date[:4]) if len(rel_date) >= 4 and rel_date[:4].isdigit() else None
-                            if target_year and item_year and item_year != target_year:
-                                continue
-                            chosen = item
-                            resolved_year = item_year or resolved_year
-                            break
-
-                        if not chosen and results and not target_year:
-                            chosen = results[0]
-                            rel_date = chosen.get("release_date") or chosen.get("first_air_date") or ""
-                            if len(rel_date) >= 4 and rel_date[:4].isdigit():
-                                resolved_year = int(rel_date[:4])
-
-                        if chosen:
-                            public_title = chosen.get("title") or chosen.get("name") or public_title
-                            original_title = chosen.get("original_title") or chosen.get("original_name") or ""
-                            lang = chosen.get("original_language", "")
-                            if chosen.get("media_type") == "tv":
-                                is_series = True
-                            vote = chosen.get("vote_average")
-                            if vote and float(vote) > 0:
-                                rating = f"{float(vote):.1f}/10"
-                            for gid in (chosen.get("genre_ids") or []):
-                                if gid in TMDB_GENRE_MAP and TMDB_GENRE_MAP[gid] not in genres_list:
-                                    genres_list.append(TMDB_GENRE_MAP[gid])
-            except Exception:
-                pass
-
-        # 2. OMDb Lookup
-        if OMDB_API_KEY:
-            try:
+                OMDB_CALL_COUNT += 1
                 y_param = f"&y={target_year}" if target_year else ""
                 url = f"https://www.omdbapi.com/?apikey={OMDB_API_KEY}&t={quote_plus(clean)}{y_param}"
                 async with session.get(url, timeout=4) as r:
@@ -527,7 +621,7 @@ async def fetch_meta(title: str, target_year: int = None):
             except Exception:
                 pass
 
-        # 3. Apple iTunes Search API (Free, No Key Required, Official Popular English Title & Genres)
+        # 3. Apple iTunes Search API (100% Free, Unlimited, Official Popular Title & Genres)
         if not genres_list or public_title.lower() == clean:
             try:
                 itunes_url = f"https://itunes.apple.com/search?term={quote_plus(clean)}&limit=5"
@@ -551,7 +645,7 @@ async def fetch_meta(title: str, target_year: int = None):
             except Exception:
                 pass
 
-        # 4. TVMaze + IMDb Public Suggestion API Fallback
+        # 4. TVMaze + IMDb Public Suggestion Fallback
         if not genres_list or public_title.lower() == clean or not resolved_year:
             try:
                 tvm_url = f"https://api.tvmaze.com/singlesearch/shows?q={quote_plus(clean)}"
@@ -599,9 +693,11 @@ async def fetch_meta(title: str, target_year: int = None):
         "language": lang,
         "runtime": runtime,
         "rating": rating,
+        "collection_id": collection_id,
         "is_series": is_series
     }
     META_CACHE[cache_key] = result
+    save_db_cached_meta(cache_key, result)
     return result
 
 async def fetch_official_catalog(title: str) -> dict:
@@ -623,6 +719,24 @@ async def fetch_official_catalog(title: str) -> dict:
         except Exception:
             pass
 
+        if TMDB_API_KEY and not franchise_movies:
+            async with TMDB_SEMAPHORE:
+                try:
+                    c_url = f"https://api.themoviedb.org/3/search/collection?api_key={TMDB_API_KEY}&language=en-US&query={quote_plus(clean)}"
+                    async with session.get(c_url, timeout=4) as cr:
+                        if cr.status == 200:
+                            c_res = (await cr.json()).get("results") or []
+                            if c_res:
+                                col_id = c_res[0]["id"]
+                                d_url = f"https://api.themoviedb.org/3/collection/{col_id}?api_key={TMDB_API_KEY}&language=en-US"
+                                async with session.get(d_url, timeout=4) as dr:
+                                    if dr.status == 200:
+                                        for p in (await dr.json()).get("parts") or []:
+                                            if p.get("title"):
+                                                franchise_movies.append(p["title"])
+                except Exception:
+                    pass
+
         if not seasons_map and not franchise_movies:
             try:
                 first_char = clean[0] if clean else "a"
@@ -638,10 +752,10 @@ async def fetch_official_catalog(title: str) -> dict:
             except Exception:
                 pass
 
-    return {"seasons": seasons_map, "franchise_movies": franchise_movies[:10]}
+    return {"seasons": seasons_map, "franchise_movies": franchise_movies[:12]}
 
 # ============================================================================
-# 5. SUBTITLE-PROOF AUDIO PARSER, POPULAR TITLE CAPTION & GENRE-FIRST ROUTER
+# 5. SUBTITLE-PROOF AUDIO PARSER, PUBLIC HEAD TITLE CAPTION & GENRE ROUTER
 # ============================================================================
 def strip_subtitle_sections(caption: str) -> str:
     if not caption:
@@ -728,6 +842,7 @@ def extract_tech_specs(filename="", caption="", file_size_bytes=0, meta=None):
         (r"\b(?:tamil|tam)\b", "Tamil"),
         (r"\b(?:telugu|tel)\b", "Telugu"),
         (r"\b(?:malayalam|mal)\b", "Malayalam"),
+        (r"\b(?:kannada|kan)\b", "Kannada"),
         (r"\b(?:turkish|tur)\b", "Turkish"),
         (r"\b(?:amharic|amh|ትርጉም)\b", "Amharic")
     ]:
@@ -743,12 +858,13 @@ def extract_tech_specs(filename="", caption="", file_size_bytes=0, meta=None):
         mapped = orig_lang_map.get((meta.get("language") or "").lower(), "English")
         detected_langs.append(mapped)
 
+    audio_tier = extract_audio_tier(audio_only_text, len(detected_langs))
     audio_lines = [f"* {aud_codec} — {lang_name}" for lang_name in detected_langs]
 
     audio_mode = ""
-    if len(detected_langs) >= 3 or re.search(r"\bmulti\s*audio\b", audio_only_text, re.I):
-        audio_mode = f"Multi Audio ({', '.join(detected_langs[:4])})"
-    elif len(detected_langs) == 2 or re.search(r"\bdual\s*audio\b", audio_only_text, re.I):
+    if audio_tier == 3:
+        audio_mode = f"Multi Audio / Dubbed ({', '.join(detected_langs[:4])})"
+    elif audio_tier == 2:
         audio_mode = f"Dual Audio ({' + '.join(detected_langs)})"
     elif detected_langs:
         audio_mode = f"{detected_langs[0]} ({aud_codec})"
@@ -759,6 +875,7 @@ def extract_tech_specs(filename="", caption="", file_size_bytes=0, meta=None):
         "source": source,
         "codec": codec,
         "audio_mode": audio_mode,
+        "audio_tier": audio_tier,
         "size_str": format_size_human(file_size_bytes),
         "duration": duration,
         "bitrate": bitrate,
@@ -769,7 +886,6 @@ def extract_tech_specs(filename="", caption="", file_size_bytes=0, meta=None):
     }
 
 def build_final_caption(filename, caption, meta=None, file_size_bytes=0, ep_tag="MOVIE"):
-    """Formats the forwarded file using its Official Popular Published Title & Release Year."""
     meta = meta or {}
     sp = extract_tech_specs(filename, caption, file_size_bytes, meta)
     dur = sp["duration"] or meta.get("runtime", "")
@@ -779,9 +895,9 @@ def build_final_caption(filename, caption, meta=None, file_size_bytes=0, ep_tag=
     year_str = f" ({pub_year})" if pub_year and str(pub_year) not in pub_title else ""
     ep_str = f" - {ep_tag}" if ep_tag and ep_tag != "MOVIE" else ""
 
-    # Clean Popular Published File Name (no scene spam)
+    dub_badge = " [Multi-Audio]" if sp["audio_tier"] == 3 else (" [Dual-Audio]" if sp["audio_tier"] == 2 else "")
     spec_tag = " ".join(p for p in [sp["quality"], sp["source"], sp["codec"]] if p)
-    clean_public_file = f"{pub_title}{year_str}{ep_str} [{spec_tag}].mkv"
+    clean_public_file = f"{pub_title}{year_str}{ep_str}{dub_badge} [{spec_tag}].mkv"
 
     lines = [
         f"🎬 <b>{pub_title}{year_str}{ep_str}</b>"
@@ -864,7 +980,7 @@ def detect_category(filename, caption, meta):
         return "action"
 
     # Regional Language Channels for Drama/Comedy/Romance/History
-    if lang in INDIAN_LANG_CODES or re.search(r"\b(hindi|bollywood|telugu|tamil|malayalam)\b", f"{fn_low} {audio_line}"):
+    if lang in INDIAN_LANG_CODES or re.search(r"\b(hindi|bollywood|telugu|tamil|malayalam|kannada)\b", f"{fn_low} {audio_line}"):
         return "hindi"
 
     if lang == "ko" or re.search(r"\b(korean|k-drama)\b", f"{fn_low} {audio_line}"):
@@ -902,7 +1018,10 @@ async def publish_file_with_green_buttons(dest_channel: int, media, final_captio
             async with session.post(api_url, data=payload, timeout=10) as resp:
                 data = await resp.json()
                 if data.get("ok"):
+                    new_msg_id = (data.get("result") or {}).get("message_id")
                     await client.delete_messages(dest_channel, [sent_msg.id])
+                    if new_msg_id:
+                        sent_msg.id = int(new_msg_id)
                 else:
                     print(f"⚠️ Bot API copyMessage notice: {data.get('description')}")
     except Exception as e:
@@ -911,8 +1030,28 @@ async def publish_file_with_green_buttons(dest_channel: int, media, final_captio
     return sent_msg
 
 # ============================================================================
-# 6. DEEP MULTI-PAGE BUTTON SCORING
+# 6. DEEP MULTI-PAGE BUTTON SCORING (PRIORITIZES DUB / DUAL / MULTI-AUDIO)
 # ============================================================================
+def score_quality_button(text: str) -> int:
+    t = text.upper()
+    score = 0
+    if "2160P" in t or "4K" in t: score += 1200
+    elif "1080P" in t: score += 1000
+    elif "720P" in t: score += 700
+    elif "480P" in t: score += 400
+    elif "360P" in t: score += 200
+
+    # Extra high score for Dubbed / Multi-Audio / Dual-Audio options
+    if any(k in t for k in ["MULTI", "DUAL", "DUB", "HIN", "ENG"]):
+        score += 450
+    if "BLURAY" in t or "BD" in t: score += 200
+    elif "WEB-DL" in t: score += 150
+    elif "HDRIP" in t: score += 120
+
+    if "HEVC" in t or "X265" in t or "10BIT" in t: score += 60
+    if "PAHE" in t: score -= 10
+    return score
+
 def find_matching_title_buttons_on_page(buttons, query: str, target_year: int = None, visited_keys: set = None):
     visited_keys = visited_keys or set()
     clean_q = normalize_title_key(query)
@@ -947,33 +1086,15 @@ def find_matching_title_buttons_on_page(buttons, query: str, target_year: int = 
             elif "🎬" in txt:
                 score += 150
 
-            score += score_quality_button(txt) // 5
+            score += score_quality_button(txt) // 4
             candidates.append((score, txt, btn))
 
     candidates.sort(key=lambda x: x[0], reverse=True)
     return candidates
 
-def score_quality_button(text: str) -> int:
-    t = text.upper()
-    score = 0
-    if "2160P" in t or "4K" in t: score += 1200
-    elif "1080P" in t: score += 1000
-    elif "720P" in t: score += 700
-    elif "480P" in t: score += 400
-    elif "360P" in t: score += 200
-
-    if "MULTI" in t or "DUAL" in t: score += 350
-    if "BLURAY" in t or "BD" in t: score += 200
-    elif "WEB-DL" in t: score += 150
-    elif "HDRIP" in t: score += 120
-
-    if "HEVC" in t or "X265" in t or "10BIT" in t: score += 60
-    if "PAHE" in t: score -= 10
-    return score
-
 def collect_resolution_quality_buttons(buttons, visited_qualities: set = None):
     visited_qualities = visited_qualities or set()
-    res_map = {}
+    res_list = []
     for row in buttons:
         for btn in row:
             txt = (btn.text or "").strip()
@@ -986,14 +1107,10 @@ def collect_resolution_quality_buttons(buttons, visited_qualities: set = None):
             if s <= 0:
                 continue
             res = extract_resolution_tag(txt, "OTHER")
-            if res not in res_map or s > res_map[res][0]:
-                res_map[res] = (s, txt, btn)
+            res_list.append((s, res, txt, btn))
 
-    ordered = []
-    for r in TARGET_RESOLUTIONS + ["OTHER"]:
-        if r in res_map:
-            ordered.append((r, res_map[r][1], res_map[r][2]))
-    return ordered
+    res_list.sort(key=lambda x: x[0], reverse=True)
+    return [(r, txt, btn) for _, r, txt, btn in res_list]
 
 def parse_size_mb(text: str) -> float:
     m = re.search(r"(\d+(?:\.\d+)?)\s*(GB|MB|KB)", text or "", re.I)
@@ -1048,7 +1165,7 @@ async def smart_click_button(btn):
     except asyncio.TimeoutError:
         pass
     except FloodWaitError as fw:
-        await asyncio.sleep(fw.seconds + 1)
+        await asyncio.sleep(fw.seconds + 2)
     except Exception as e:
         print(f"⚠️ Button click notice: {e}")
     return True
@@ -1112,7 +1229,7 @@ def is_file_or_episode_grid(msg) -> bool:
     return False
 
 # ============================================================================
-# 8. INCOMING MEDIA EVENT (FORWARDS WITH POPULAR PUBLISHED TITLE + GREEN BUTTONS)
+# 8. INCOMING MEDIA EVENT (AUTO-UPGRADES INFERIOR AUDIO & READJUSTS CHANNEL)
 # ============================================================================
 @client.on(events.NewMessage(incoming=True))
 async def on_media_arrival(event):
@@ -1148,6 +1265,9 @@ async def on_media_arrival(event):
     file_year = ACTIVE_TARGET_YEAR or extract_year_from_text(real_fn)
     title_for_meta = ACTIVE_CLEAN_TITLE or normalize_title_key(real_fn)
     meta = await fetch_meta(title_for_meta, file_year)
+    sp = extract_tech_specs(raw_fn, caption, file_size, meta)
+    new_audio_tier = sp["audio_tier"]
+
     cat = detect_category(real_fn, caption, meta)
     dest_channel = DEFAULT_CHANNELS.get(cat, DEFAULT_CHANNELS["other"])
     cat_emoji = CATEGORY_EMOJIS.get(cat, "📁")
@@ -1157,37 +1277,50 @@ async def on_media_arrival(event):
     pub_key = normalize_title_key(meta.get("public_title") or title_for_meta)
     title_key = ACTIVE_CLEAN_TITLE or pub_key
 
-    if is_already_in_any_channel(title_key, ep_tag, res_tag) or is_already_in_any_channel(pub_key, ep_tag, res_tag):
-        print(f"⏭️ Duplicate detected ({meta.get('public_title')} • {ep_tag} • {res_tag}) — skipping upload.")
-        FILE_COMPLETED_EVENT.set()
-        return
+    # Check if already stored; if the new file has a BETTER Audio Tier (e.g. Dual/Multi-Audio Dubbed vs Single)
+    # or the old file was in the wrong channel, DELETE the old message and replace with the better one!
+    existing = get_stored_file_record(pub_key, ep_tag, res_tag) or get_stored_file_record(title_key, ep_tag, res_tag)
+    if existing:
+        old_ch, old_msg_id, old_tier = existing
+        if new_audio_tier <= (old_tier or 1) and old_ch == dest_channel:
+            print(f"⏭️ Duplicate ({meta.get('public_title')} • {ep_tag} • {res_tag}) — already stored with equal/better audio.")
+            FILE_COMPLETED_EVENT.set()
+            return
+        else:
+            print(f"♻️ Upgrading/Readjusting '{meta.get('public_title')}' [{ep_tag} • {res_tag}] (Old Tier {old_tier} ➔ New Tier {new_audio_tier})!")
+            if old_ch and old_msg_id:
+                try:
+                    await client.delete_messages(old_ch, [old_msg_id])
+                except Exception:
+                    pass
 
     final_caption = build_final_caption(raw_fn, caption, meta, file_size, ep_tag)
 
     try:
-        await publish_file_with_green_buttons(dest_channel, msg.media, final_caption)
-        print(f"🚀 Published Popular Title: '{meta['public_title']}' [{ep_tag} • {res_tag}] ➔ {cat_emoji} {cat.upper()}")
+        sent_msg = await publish_file_with_green_buttons(dest_channel, msg.media, final_caption)
+        sent_id = sent_msg.id if sent_msg else 0
+        print(f"🚀 Published '{meta['public_title']}' [{ep_tag} • {res_tag} • Tier {new_audio_tier}] ➔ {cat_emoji} {cat.upper()}")
 
-        record_indexed_file(dest_channel, title_key, ep_tag, res_tag, real_fn)
-        record_indexed_file(dest_channel, pub_key, ep_tag, res_tag, real_fn)
+        record_indexed_file(dest_channel, sent_id, title_key, ep_tag, res_tag, new_audio_tier, real_fn)
+        record_indexed_file(dest_channel, sent_id, pub_key, ep_tag, res_tag, new_audio_tier, real_fn)
 
         await client.send_message(
             "me",
             f"✅ <b>Published to Storage!</b>\n"
-            f"• <b>Published Title:</b> <code>{meta['public_title']} ({meta.get('year') or 'N/A'})</code>\n"
-            f"• <b>Spec:</b> <code>{ep_tag} • {res_tag} ({format_size_human(file_size)})</code>\n"
+            f"• <b>Public Title:</b> <code>{meta['public_title']} ({meta.get('year') or 'N/A'})</code>\n"
+            f"• <b>Spec:</b> <code>{ep_tag} • {res_tag} • {sp['audio_mode']} ({format_size_human(file_size)})</code>\n"
             f"• <b>Genre Channel:</b> {cat_emoji} <code>{cat.upper()}</code> ({meta.get('genres') or 'General'})",
             parse_mode="HTML"
         )
     except FloodWaitError as fw:
-        await asyncio.sleep(fw.seconds + 1)
+        await asyncio.sleep(fw.seconds + 2)
     except Exception as e:
         print(f"❌ Storage Forward error: {e}")
     finally:
         FILE_COMPLETED_EVENT.set()
 
 # ============================================================================
-# 9. DEEP MULTI-PAGE NAVIGATOR
+# 9. DEEP MULTI-PAGE NAVIGATOR (ALL DUB/QUALITY OPTIONS + NEXT ⏩)
 # ============================================================================
 async def navigate_to_grid(
     query: str,
@@ -1214,7 +1347,7 @@ async def navigate_to_grid(
     title_page_tries = 0
     quality_page_tries = 0
 
-    for _ in range(35):
+    for _ in range(38):
         if SKIP_CURRENT_TITLE:
             break
         msg = await find_latest_menu_message(SOURCE_BOT, tracked_menu_id)
@@ -1263,9 +1396,10 @@ async def navigate_to_grid(
                 _, btn_txt, chosen_btn = candidates[0]
                 visited_title_btns.add(btn_txt)
                 btn_res = extract_resolution_tag(btn_txt, "HD")
+                btn_tier = extract_audio_tier(btn_txt)
 
-                if btn_res != "HD" and is_already_in_any_channel(query, "MOVIE", btn_res):
-                    print(f"⏭️ [Screen 1] Skipping '{btn_txt}' — {btn_res} already in storage.")
+                if btn_res != "HD" and is_already_in_any_channel(query, "MOVIE", btn_res, min_audio_tier=btn_tier):
+                    print(f"⏭️ [Screen 1] Skipping '{btn_txt}' — {btn_res} (Tier {btn_tier}) already in storage.")
                     continue
 
                 print(f"👉 [Screen 1/Title] Clicking option: '{btn_txt}'")
@@ -1315,7 +1449,7 @@ async def navigate_to_grid(
             await wait_for_menu_update(SOURCE_BOT, tracked_menu_id, old_sig)
             continue
 
-        # 5. Screen C: Quality Selection (Clicks Next ⏩ across Quality Pages 1..6)
+        # 5. Screen C: Quality & Dub Selection (Clicks Next ⏩ across Quality Pages 1..6)
         if "select the available quality" in text or "quality" in text:
             res_options = collect_resolution_quality_buttons(msg.buttons, visited_quality_btns)
             for r_tag, _, _ in res_options:
@@ -1343,7 +1477,8 @@ async def navigate_to_grid(
                         return None, available_seasons, discovered_resolutions
             else:
                 for r_tag, r_txt, r_btn in res_options:
-                    if not is_already_in_any_channel(query, "MOVIE", r_tag):
+                    q_tier = extract_audio_tier(r_txt)
+                    if not is_already_in_any_channel(query, "MOVIE", r_tag, min_audio_tier=q_tier):
                         chosen_qual_btn = r_btn
                         chosen_qual_txt = r_txt
                         break
@@ -1423,16 +1558,17 @@ async def download_from_grid(
                     ep_tag = "MOVIE"
 
                 btn_res = extract_resolution_tag(txt, ACTIVE_RES_TAG)
-                size_mb = parse_size_mb(txt)
+                btn_tier = extract_audio_tier(txt)
+                size_mb = parse_size_mb(txt) + (btn_tier * 250.0)
                 item_key = (ep_tag, btn_res, ep_num)
 
                 item_counts[item_key] = item_counts.get(item_key, 0) + 1
                 if item_key not in best_item_map:
                     item_order.append(item_key)
-                    best_item_map[item_key] = (size_mb, btn)
+                    best_item_map[item_key] = (size_mb, btn, btn_tier)
                 else:
                     if size_mb > best_item_map[item_key][0]:
-                        best_item_map[item_key] = (size_mb, btn)
+                        best_item_map[item_key] = (size_mb, btn, btn_tier)
 
         if next_button and len(item_order) >= 2 and remaining_targets is None:
             last_key = item_order[-1]
@@ -1445,10 +1581,10 @@ async def download_from_grid(
         for ep_tag, btn_res, ep_num in item_order:
             if SKIP_CURRENT_TITLE:
                 break
-            _, btn = best_item_map[(ep_tag, btn_res, ep_num)]
+            _, btn, btn_tier = best_item_map[(ep_tag, btn_res, ep_num)]
 
             check_res = "ANY" if only_missing else btn_res
-            if is_already_in_any_channel(ACTIVE_CLEAN_TITLE, ep_tag, check_res):
+            if is_already_in_any_channel(ACTIVE_CLEAN_TITLE, ep_tag, check_res, min_audio_tier=btn_tier):
                 print(f"⏭️ Already have {ACTIVE_CLEAN_TITLE} [{ep_tag} • {btn_res}] in storage.")
                 if remaining_targets is not None and ep_num in remaining_targets:
                     remaining_targets.discard(ep_num)
@@ -1503,27 +1639,22 @@ async def download_from_grid(
             break
 
 # ============================================================================
-# 11. REAL-TIME LIVE RADAR + MULTI-CATEGORY CRAWLER (TODAY ➔ 1990s)
+# 11. REAL-TIME RADAR + TRENDING/HIGHEST-RATED/POPULAR CRAWLER (TODAY ➔ 1990s)
 # ============================================================================
 CRAWLER_MODES = [
-    "movie",      # Global / Hollywood Movies
+    "movie",      # Hollywood / Global Movies
     "anime",      # Japanese Anime Movies & Series
     "animation",  # Animated Movies (Disney, Pixar, DreamWorks)
-    "bollywood",  # Hindi, Tamil, Telugu, Malayalam Movies
+    "bollywood",  # Bollywood & South Indian (Hindi, Tamil, Telugu, Malayalam, Kannada)
     "korean",     # Korean Movies & K-Dramas
-    "horror",     # Horror & Thriller Movies
-    "action",     # Action & Sci-Fi Movies
+    "turkish",    # Turkish Movies & Series
+    "amharic",    # Ethiopian / Amharic Movies
+    "horror",     # Horror, Thriller & Mystery Movies
+    "action",     # Action, Adventure & Sci-Fi Movies
     "tv"          # Global TV Series
 ]
 
 async def fetch_realtime_live_releases() -> list:
-    """
-    Zero-Time-Gap Real-Time Radar:
-    Pulls movies & episodes releasing/airing TODAY in real time from:
-    1. TMDB Daily Trending + Now Playing + Airing Today (en-US popular titles)
-    2. TVMaze Live Daily Schedule (free, real-time airing episodes today)
-    3. Apple iTunes Real-Time Top Movies RSS Feed (free, instant digital releases)
-    """
     live_items = []
     today_str = current_utc_date_str()
     now_yr = current_utc_year()
@@ -1533,30 +1664,31 @@ async def fetch_realtime_live_releases() -> list:
             for ep_path in [
                 f"trending/all/day?api_key={TMDB_API_KEY}&language=en-US",
                 f"movie/now_playing?api_key={TMDB_API_KEY}&language=en-US&page=1",
-                f"tv/airing_today?api_key={TMDB_API_KEY}&language=en-US&page=1"
+                f"tv/airing_today?api_key={TMDB_API_KEY}&language=en-US&page=1",
+                f"movie/top_rated?api_key={TMDB_API_KEY}&language=en-US&page=1"
             ]:
-                try:
-                    url = f"https://api.themoviedb.org/3/{ep_path}"
-                    async with session.get(url, timeout=4) as r:
-                        if r.status == 200:
-                            for it in (await r.json()).get("results", []):
-                                name = it.get("title") or it.get("name")
-                                r_date = it.get("release_date") or it.get("first_air_date") or ""
-                                yr = int(r_date[:4]) if len(r_date) >= 4 and r_date[:4].isdigit() else now_yr
-                                is_tv = it.get("media_type") == "tv" or "tv/" in ep_path
-                                if name:
-                                    live_items.append((name, None if is_tv else yr))
-                except Exception:
-                    pass
+                async with TMDB_SEMAPHORE:
+                    try:
+                        url = f"https://api.themoviedb.org/3/{ep_path}"
+                        async with session.get(url, timeout=4) as r:
+                            if r.status == 200:
+                                for it in (await r.json()).get("results", []):
+                                    name = it.get("title") or it.get("name")
+                                    r_date = it.get("release_date") or it.get("first_air_date") or ""
+                                    yr = int(r_date[:4]) if len(r_date) >= 4 and r_date[:4].isdigit() else now_yr
+                                    is_tv = it.get("media_type") == "tv" or "tv/" in ep_path
+                                    if name:
+                                        live_items.append((name, None if is_tv else yr))
+                        await asyncio.sleep(0.25)
+                    except Exception:
+                        pass
 
-        # Real-Time Apple iTunes Top Movies RSS (No API Key Needed)
         try:
             rss_url = "https://itunes.apple.com/us/rss/topmovies/limit=25/json"
             async with session.get(rss_url, timeout=4) as r:
                 if r.status == 200:
                     data = await r.json(content_type=None)
-                    entries = data.get("feed", {}).get("entry") or []
-                    for ent in entries:
+                    for ent in (data.get("feed", {}).get("entry") or []):
                         name = (ent.get("im:name") or {}).get("label")
                         rel = ((ent.get("im:releaseDate") or {}).get("label") or "")[:4]
                         yr = int(rel) if rel.isdigit() else now_yr
@@ -1565,7 +1697,6 @@ async def fetch_realtime_live_releases() -> list:
         except Exception:
             pass
 
-        # Real-Time TVMaze Today's Airing Schedule (No API Key Needed)
         try:
             sched_url = f"https://api.tvmaze.com/schedule/web?date={today_str}"
             async with session.get(sched_url, timeout=4) as r:
@@ -1581,46 +1712,71 @@ async def fetch_realtime_live_releases() -> list:
     return live_items
 
 async def fetch_discover_batch(year: int, page: int, media_kind: str) -> list:
+    """
+    Page 1 = Trending / Most Popular (popularity.desc)
+    Page 2 = Highest Rated Masterpieces (vote_average.desc, vote_count>=80)
+    Page 3 = Mid/Lower Rated & Newest By Date (vote_average.desc, vote_count>=15)
+    """
     discovered = []
+    today_str = current_utc_date_str()
+    now_yr = current_utc_year()
+
     async with aiohttp.ClientSession() as session:
-        if TMDB_API_KEY:
-            try:
-                endpoint = "tv" if media_kind in ("tv", "anime") else "movie"
-                yr_key = "first_air_date_year" if endpoint == "tv" else "primary_release_year"
-                extra_params = ""
+        if TMDB_API_KEY and media_kind != "amharic":
+            async with TMDB_SEMAPHORE:
+                try:
+                    endpoint = "tv" if media_kind in ("tv", "anime") else "movie"
+                    yr_key = "first_air_date_year" if endpoint == "tv" else "primary_release_year"
+                    date_lte_key = "first_air_date.lte" if endpoint == "tv" else "primary_release_date.lte"
 
-                if media_kind == "anime":
-                    extra_params = "&with_genres=16&with_original_language=ja"
-                elif media_kind == "animation":
-                    extra_params = "&with_genres=16"
-                elif media_kind == "bollywood":
-                    extra_params = "&with_original_language=hi"
-                elif media_kind == "korean":
-                    extra_params = "&with_original_language=ko"
-                elif media_kind == "horror":
-                    extra_params = "&with_genres=27"
-                elif media_kind == "action":
-                    extra_params = "&with_genres=28"
+                    date_filter = f"&{yr_key}={year}"
+                    if year >= now_yr:
+                        date_filter += f"&{date_lte_key}={today_str}"
 
-                d_url = (
-                    f"https://api.themoviedb.org/3/discover/{endpoint}"
-                    f"?api_key={TMDB_API_KEY}&language=en-US&{yr_key}={year}&sort_by=popularity.desc{extra_params}&page={page}"
-                )
-                async with session.get(d_url, timeout=5) as dr:
-                    if dr.status == 200:
-                        for it in (await dr.json()).get("results", []):
-                            name = it.get("title") or it.get("name")
-                            if name:
-                                discovered.append((name, None if endpoint == "tv" else year))
-            except Exception:
-                pass
+                    if page == 1:
+                        sort_param = "&sort_by=popularity.desc"
+                    elif page == 2:
+                        sort_param = "&sort_by=vote_average.desc&vote_count.gte=80"
+                    else:
+                        sort_param = "&sort_by=vote_average.desc&vote_count.gte=15"
+
+                    extra_params = ""
+                    if media_kind == "anime":
+                        extra_params = "&with_genres=16&with_original_language=ja"
+                    elif media_kind == "animation":
+                        extra_params = "&with_genres=16"
+                    elif media_kind == "bollywood":
+                        extra_params = "&with_original_language=hi|ta|te|ml|kn"
+                    elif media_kind == "korean":
+                        extra_params = "&with_original_language=ko"
+                    elif media_kind == "turkish":
+                        extra_params = "&with_original_language=tr"
+                    elif media_kind == "horror":
+                        extra_params = "&with_genres=27|53"
+                    elif media_kind == "action":
+                        extra_params = "&with_genres=28|12|878"
+
+                    d_url = (
+                        f"https://api.themoviedb.org/3/discover/{endpoint}"
+                        f"?api_key={TMDB_API_KEY}&language=en-US{date_filter}{sort_param}{extra_params}&page={page}"
+                    )
+                    async with session.get(d_url, timeout=5) as dr:
+                        if dr.status == 200:
+                            for it in (await dr.json()).get("results", []):
+                                name = it.get("title") or it.get("name")
+                                if name:
+                                    discovered.append((name, None if endpoint == "tv" else year))
+                    await asyncio.sleep(0.25)
+                except Exception:
+                    pass
 
         if not discovered:
             try:
                 term_map = {
                     "movie": f"{year}", "anime": f"anime {year}", "animation": f"animation {year}",
-                    "bollywood": f"hindi {year}", "korean": f"korean {year}",
-                    "horror": f"horror {year}", "action": f"action {year}", "tv": f"season {year}"
+                    "bollywood": f"indian {year}", "korean": f"korean {year}", "turkish": f"turkish {year}",
+                    "amharic": f"ethiopian movie {year}", "horror": f"horror {year}",
+                    "action": f"action {year}", "tv": f"season {year}"
                 }
                 search_term = term_map.get(media_kind, f"{year}")
                 ent = "tvSeason" if media_kind in ("tv", "anime") else "movie"
@@ -1643,7 +1799,7 @@ async def fetch_discover_batch(year: int, page: int, media_kind: str) -> list:
 async def auto_discovery_crawler_worker():
     global LAST_REALTIME_RADAR_TS
     await asyncio.sleep(8.0)
-    print("🤖 Real-Time Live Radar + Multi-Category Crawler (Today ➔ 1990s) LIVE!")
+    print("🤖 24/7 Real-Time Radar + Multi-Category Crawler (Trending ➔ Highest Rated ➔ 1990s) LIVE!")
 
     while True:
         try:
@@ -1654,7 +1810,7 @@ async def auto_discovery_crawler_worker():
             now_ts = asyncio.get_event_loop().time()
             queued_one = False
 
-            # 1. REAL-TIME RADAR: Every 15 minutes, check Today's Live Releases FIRST (Zero Time Gap!)
+            # 1. REAL-TIME RADAR: Check Today's Live Releases & Top Rated every 15 minutes
             if (now_ts - LAST_REALTIME_RADAR_TS) >= 900:
                 live_batch = await fetch_realtime_live_releases()
                 for title_name, yr in live_batch:
@@ -1662,7 +1818,7 @@ async def auto_discovery_crawler_worker():
                     if not clean_t or clean_t == "unknown" or is_title_crawled_recently(clean_t, hours=6):
                         continue
                     mark_title_crawled(clean_t, yr)
-                    if len(get_existing_resolutions(clean_t, "MOVIE")) >= 3:
+                    if len(get_existing_resolutions(clean_t, "MOVIE")) >= 4:
                         continue
 
                     cmd = {
@@ -1673,7 +1829,7 @@ async def auto_discovery_crawler_worker():
                         "season": None,
                         "episodes": None
                     }
-                    print(f"⚡ [Real-Time Live Radar] Queued Latest Release: {cmd['raw']}")
+                    print(f"⚡ [Real-Time Live Radar] Queued: {cmd['raw']}")
                     TITLE_QUEUE.append((cmd, True))
                     asyncio.create_task(process_queue())
                     queued_one = True
@@ -1686,7 +1842,7 @@ async def auto_discovery_crawler_worker():
                 await asyncio.sleep(6.0)
                 continue
 
-            # 2. MULTI-CATEGORY HISTORICAL CRAWLER (Current Year -> 1990)
+            # 2. MULTI-CATEGORY CRAWLER (Today's Year -> 1990 across all 10 Categories & Rating Tiers)
             year, page, kind = get_crawler_progress()
             if kind not in CRAWLER_MODES:
                 kind = "movie"
@@ -1698,7 +1854,7 @@ async def auto_discovery_crawler_worker():
                     continue
 
                 mark_title_crawled(clean_t, yr)
-                if len(get_existing_resolutions(clean_t, "MOVIE")) >= 3:
+                if len(get_existing_resolutions(clean_t, "MOVIE")) >= 4:
                     continue
 
                 cmd = {
@@ -1709,7 +1865,8 @@ async def auto_discovery_crawler_worker():
                     "season": None,
                     "episodes": None
                 }
-                print(f"🌟 [Auto-Crawler {year} • {kind.upper()} P{page}] Queued: {cmd['raw']}")
+                tier_lbl = "POPULAR" if page == 1 else ("HIGHEST-RATED" if page == 2 else "LOWER-RATED/GEMS")
+                print(f"🌟 [Auto-Crawler {year} • {kind.upper()} • {tier_lbl}] Queued: {cmd['raw']}")
                 TITLE_QUEUE.append((cmd, True))
                 asyncio.create_task(process_queue())
                 queued_one = True
@@ -1734,8 +1891,40 @@ async def auto_discovery_crawler_worker():
             await asyncio.sleep(10.0)
 
 # ============================================================================
-# 12. MASTER UNSTOPPABLE QUEUE WORKER & MISSING-FILES AUDITOR
+# 12. CHANNEL READJUSTER, FRANCHISE/SERIES REFILLER & MASTER QUEUE WORKER
 # ============================================================================
+async def readjust_all_storage_channels():
+    """Scans storage channels to fix misrouted genres, raw filenames, or missing green buttons."""
+    await ensure_dialogs_cached()
+    fixed_count = 0
+    for ch_id in ALL_STORAGE_CHANNELS:
+        try:
+            async for msg in client.iter_messages(ch_id, limit=40):
+                if not (msg.video or msg.document):
+                    continue
+                fn = (msg.file.name if msg.file else "") or ""
+                txt = msg.text or ""
+                real_fn = extract_real_filename(fn, txt)
+                yr = extract_year_from_text(real_fn)
+                meta = await fetch_meta(real_fn, yr)
+                correct_cat = detect_category(real_fn, txt, meta)
+                correct_ch = DEFAULT_CHANNELS.get(correct_cat, DEFAULT_CHANNELS["other"])
+
+                if ch_id != correct_ch or "🎬" not in txt:
+                    ep_tag = extract_season_ep_tag(f"{real_fn}\n{txt}", "S01")
+                    res_tag = extract_resolution_tag(f"{real_fn}\n{txt}", "1080P")
+                    aud_tier = extract_audio_tier(f"{real_fn}\n{txt}")
+                    sz = msg.file.size if msg.file else 0
+                    new_cap = build_final_caption(fn or real_fn, txt, meta, sz, ep_tag)
+                    sent = await publish_file_with_green_buttons(correct_ch, msg.media, new_cap)
+                    await client.delete_messages(ch_id, [msg.id])
+                    record_indexed_file(correct_ch, sent.id if sent else 0, meta["public_title"], ep_tag, res_tag, aud_tier, real_fn)
+                    fixed_count += 1
+                    await asyncio.sleep(1.5)
+        except Exception:
+            pass
+    return fixed_count
+
 async def execute_missing_audit_and_fill(cmd: dict):
     title = cmd["title"]
     target_year = cmd.get("year")
@@ -1754,9 +1943,9 @@ async def execute_missing_audit_and_fill(cmd: dict):
 
         await client.send_message(
             "me",
-            f"🔎 <b>Franchise Audit:</b> <code>{title.title()}</code>\n"
+            f"🔎 <b>Franchise Refill Audit:</b> <code>{title.title()}</code>\n"
             f"• <b>Total Parts Found:</b> <code>{len(catalog['franchise_movies'])}</code>\n"
-            f"• <b>Missing Parts ({len(missing_movies)}):</b> <code>{', '.join(missing_movies) or 'None!'}</code>",
+            f"• <b>Missing Parts Queued ({len(missing_movies)}):</b> <code>{', '.join(missing_movies) or 'None!'}</code>",
             parse_mode="HTML"
         )
         for m_title in reversed(missing_movies):
@@ -1780,10 +1969,9 @@ async def execute_missing_audit_and_fill(cmd: dict):
         summary = ", ".join(f"S{s:02d} ({len(eps)} missing)" for s, eps in sorted(missing_by_season.items()))
         await client.send_message(
             "me",
-            f"🔎 <b>Missing Files Audit:</b> <code>{title.title()}</code>\n"
+            f"🔎 <b>Series Refill Audit:</b> <code>{title.title()}</code>\n"
             f"• <b>In Storage:</b> <code>{len(existing_eps)}</code> episodes\n"
-            f"• <b>Missing:</b> <code>{summary}</code>\n"
-            f"⚡ <i>Downloading missing episodes now...</i>",
+            f"• <b>Refilling Missing:</b> <code>{summary}</code>",
             parse_mode="HTML"
         )
         for s_num, miss_eps in sorted(missing_by_season.items()):
@@ -1815,7 +2003,6 @@ async def process_queue():
                 query = cmd["title"]
                 target_year = cmd.get("year")
 
-                # Resolve Official Popular Published Title before searching!
                 meta_info = await fetch_meta(query, target_year)
                 popular_title = meta_info.get("public_title") or query
 
@@ -1850,7 +2037,6 @@ async def process_queue():
                     visited_quality_btns=visited_quality_btns
                 )
 
-                # If popular_title didn't match in the bot and differs from user's raw query, try raw query too
                 if not grid_msg and not visited_title_btns and normalize_title_key(query) != ACTIVE_CLEAN_TITLE:
                     ACTIVE_CLEAN_TITLE = normalize_title_key(query)
                     grid_msg, all_seasons, _ = await navigate_to_grid(
@@ -1887,10 +2073,10 @@ async def process_queue():
                     for res_tag in TARGET_RESOLUTIONS:
                         if SKIP_CURRENT_TITLE:
                             break
-                        if not all_seasons and is_already_in_any_channel(popular_title, "MOVIE", res_tag):
+                        if not all_seasons and is_already_in_any_channel(popular_title, "MOVIE", res_tag, min_audio_tier=2):
                             continue
 
-                        print(f"🔎 Hunting resolution {res_tag} across Quality pages (Next ⏩) for '{popular_title}'...")
+                        print(f"🔎 Hunting resolution/dub {res_tag} across Quality pages (Next ⏩) for '{popular_title}'...")
                         await asyncio.sleep(1.5)
                         res_grid, _, _ = await navigate_to_grid(
                             popular_title,
@@ -1952,13 +2138,13 @@ def enqueue_commands_bulk(raw_text: str, send_initial: bool = True) -> list:
     return parsed_list
 
 # ============================================================================
-# 13. SAVED MESSAGES COMMANDS (.auto, .queue, .skip, .clear) & TRIGGERS
+# 13. SAVED MESSAGES COMMANDS (.status, .auto, .readjust, .skip, .clear)
 # ============================================================================
 @client.on(events.NewMessage(outgoing=True))
 async def on_outgoing_trigger(event):
     global SKIP_CURRENT_TITLE, AUTO_DISCOVERY_ENABLED, ME_USER_ID
     text = (event.message.text or "").strip()
-    if not text or text.startswith(("/", "✅", "⏳", "🏁", "⚠️", "🔗", "📋", "🛑", "🔎", "🎬", "🤖", "⚡")):
+    if not text or text.startswith(("/", "✅", "⏳", "🏁", "⚠️", "🔗", "📋", "🛑", "🔎", "🎬", "🤖", "⚡", "♻️")):
         return
 
     if ME_USER_ID is None:
@@ -1969,27 +2155,35 @@ async def on_outgoing_trigger(event):
 
         if low in (".queue", ".status", "queue", "status"):
             c_yr, c_pg, c_kind = get_crawler_progress()
+            tier_lbl = "Popular" if c_pg == 1 else ("Highest-Rated" if c_pg == 2 else "Lower-Rated/Gems")
             q_list = "\n".join(
                 f"  {i+1}. <code>{t[0]['raw'] if isinstance(t[0], dict) else t[0]}</code>"
                 for i, t in enumerate(TITLE_QUEUE)
-            ) or "  <i>(Empty — Real-Time Radar & Auto-Crawler active)</i>"
+            ) or "  <i>(Empty — 24/7 Auto-Crawler Active)</i>"
             await event.reply(
-                f"📋 <b>Pipeline & Real-Time Radar Status</b>\n"
-                f"• <b>Active Title:</b> <code>{ACTIVE_CLEAN_TITLE or 'Idle'}</code> (Year: {ACTIVE_TARGET_YEAR or 'Any'} • {ACTIVE_RES_TAG or '-'})\n"
-                f"• <b>Real-Time + 1990s Crawler:</b> <code>{'ON 🟢' if AUTO_DISCOVERY_ENABLED else 'OFF 🔴'}</code> (Year: {c_yr} • {c_kind.upper()} P{c_pg})\n"
+                f"📋 <b>24/7 Pipeline & Crawler Status</b>\n"
+                f"• <b>Active Title:</b> <code>{ACTIVE_CLEAN_TITLE or 'Idle'}</code> ({ACTIVE_RES_TAG or '-'})\n"
+                f"• <b>Auto-Crawler:</b> <code>{'ON 🟢' if AUTO_DISCOVERY_ENABLED else 'OFF 🔴'}</code> ({c_yr} • {c_kind.upper()} • {tier_lbl})\n"
+                f"• <b>OMDb Daily Shield:</b> <code>{OMDB_CALL_COUNT}/{OMDB_DAILY_SAFE_LIMIT}</code> calls used today\n"
                 f"• <b>Manual Queue ({len(TITLE_QUEUE)}):</b>\n{q_list}",
                 parse_mode="HTML"
             )
             return
 
+        if low in (".readjust", "readjust"):
+            await event.reply("♻️ <b>Scanning & readjusting storage channels (fixing genres, public titles & green buttons)...</b>", parse_mode="HTML")
+            fixed = await readjust_all_storage_channels()
+            await event.reply(f"✅ <b>Readjustment Complete:</b> Fixed & re-routed <code>{fixed}</code> files!", parse_mode="HTML")
+            return
+
         if low.startswith(".auto") or low.startswith("auto "):
             if "off" in low:
                 AUTO_DISCOVERY_ENABLED = False
-                await event.reply("🤖 <b>Auto-Discovery Crawler Paused (OFF).</b> Send <code>.auto on</code> to resume.", parse_mode="HTML")
+                await event.reply("🤖 <b>Auto-Crawler Paused (OFF).</b> Send <code>.auto on</code> to resume.", parse_mode="HTML")
                 return
             elif "on" in low:
                 AUTO_DISCOVERY_ENABLED = True
-                await event.reply("🤖 <b>Auto-Discovery Crawler Resumed (ON)!</b>", parse_mode="HTML")
+                await event.reply("🤖 <b>Auto-Crawler Resumed (ON)!</b>", parse_mode="HTML")
                 return
             yr_m = re.search(r"\b(19[5-9]\d|20[0-3]\d)\b", low)
             if yr_m:
@@ -2017,13 +2211,13 @@ async def on_outgoing_trigger(event):
             for c in added[:8]:
                 y_badge = f" [{c['year']}]" if c.get("year") else ""
                 if c["mode"] == "missing":
-                    summary_lines.append(f"• 🔍 <b>Missing Audit:</b> <code>{c['title']}{y_badge}</code>")
+                    summary_lines.append(f"• 🔍 <b>Refill Missing:</b> <code>{c['title']}{y_badge}</code>")
                 elif c["mode"] == "range":
                     s_lbl = f"S{c['season']:02d}" if c["season"] else "S01"
                     e_lbl = ", ".join(f"E{e:02d}" for e in (c["episodes"] or [])[:8])
                     summary_lines.append(f"• 🎯 <b>Selective:</b> <code>{c['title']}{y_badge}</code> ({s_lbl}: {e_lbl})")
                 else:
-                    summary_lines.append(f"• 🎬 <b>Deep Multi-Res Sync:</b> <code>{c['title']}{y_badge}</code>")
+                    summary_lines.append(f"• 🎬 <b>Multi-Res & Dub Sync:</b> <code>{c['title']}{y_badge}</code>")
 
             if len(added) > 8:
                 summary_lines.append(f"<i>...and +{len(added)-8} more</i>")
@@ -2060,10 +2254,9 @@ async def handle_ping(request):
         "pipeline_active": CURRENT_PIPELINE_ACTIVE,
         "auto_crawler_enabled": AUTO_DISCOVERY_ENABLED,
         "crawler_progress": f"{c_yr} ({c_kind} page {c_pg})",
+        "omdb_calls_today": f"{OMDB_CALL_COUNT}/{OMDB_DAILY_SAFE_LIMIT}",
         "queue_length": len(TITLE_QUEUE),
-        "active_title": ACTIVE_CLEAN_TITLE,
-        "active_year": ACTIVE_TARGET_YEAR,
-        "active_resolution": ACTIVE_RES_TAG
+        "active_title": ACTIVE_CLEAN_TITLE
     })
 
 async def start_web_server():
@@ -2089,7 +2282,7 @@ async def main():
     asyncio.create_task(keep_alive_worker())
     asyncio.create_task(auto_discovery_crawler_worker())
 
-    print(f"🚀 Real-Time Radar & Deep Multi-Page Media Pipeline LIVE! Watching @{SOURCE_BOT} and Saved Messages.")
+    print(f"🚀 24/7 Unstoppable Media Pipeline LIVE! Watching @{SOURCE_BOT} and Saved Messages.")
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
