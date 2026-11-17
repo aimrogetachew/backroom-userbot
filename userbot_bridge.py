@@ -773,9 +773,12 @@ init_storage_db()
 # ============================================================================
 # 4. THE BACKROOM AI COMMANDER BRAIN (RULES + MEMORY + SELF-EVOLUTION + TOOLS)
 # ============================================================================
+LAST_GEMINI_ERROR = "None"
+
 async def ask_gemini_json(prompt: str, cache_key: str = None):
-    global GEMINI_KEY_INDEX, GEMINI_CALL_COUNT
+    global GEMINI_KEY_INDEX, GEMINI_CALL_COUNT, LAST_GEMINI_ERROR
     if not GEMINI_KEYS:
+        LAST_GEMINI_ERROR = "No GEMINI_API_KEY loaded (send .addgemini AIzaSy...)"
         return None
     if cache_key:
         cached = get_db_cached_meta(f"gemini:{cache_key}")
@@ -791,7 +794,7 @@ async def ask_gemini_json(prompt: str, cache_key: str = None):
             for _ in range(len(GEMINI_KEYS)):
                 api_key = GEMINI_KEYS[GEMINI_KEY_INDEX % len(GEMINI_KEYS)]
                 GEMINI_KEY_INDEX += 1
-                for model in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]:
+                for model in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.0-flash-lite"]:
                     try:
                         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
                         async with session.post(url, json=payload, timeout=14) as resp:
@@ -802,23 +805,32 @@ async def ask_gemini_json(prompt: str, cache_key: str = None):
                                 raw_txt = ""
                                 for p in parts:
                                     if not p.get("thought") and p.get("text"):
-                                        raw_txt = p["text"]
-                                raw_txt = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_txt.strip(), flags=re.I)
-                                parsed = json.loads(raw_txt)
-                                if cache_key and parsed:
-                                    save_db_cached_meta(f"gemini:{cache_key}", parsed)
-                                await asyncio.sleep(1.2)
-                                return parsed
-                            elif resp.status in (429, 403):
-                                break
-                    except Exception:
-                        pass
+                                        raw_txt += p["text"]
+                                m_json = re.search(r"(\{.*\}|\[.*\])", raw_txt.strip(), re.DOTALL)
+                                if m_json:
+                                    parsed = json.loads(m_json.group(1))
+                                    if cache_key and parsed:
+                                        save_db_cached_meta(f"gemini:{cache_key}", parsed)
+                                    LAST_GEMINI_ERROR = "OK"
+                                    await asyncio.sleep(1.0)
+                                    return parsed
+                            else:
+                                err_body = await resp.text()
+                                LAST_GEMINI_ERROR = f"HTTP {resp.status} ({model})"
+                                if resp.status in (429, 403, 400):
+                                    break
+                    except Exception as e:
+                        LAST_GEMINI_ERROR = str(e)[:80]
     return None
 
 async def tmdb_smart_list_fallback(user_text: str) -> list:
+    """Strictly triggers ONLY when user explicitly asks for 'top X' or 'best X' movies/series!"""
+    low = (user_text or "").lower().strip()
+    if not re.search(r"\b(?:top|best)\s+\d{1,2}\b", low):
+        return []
     if not TMDB_API_KEY:
         return []
-    low = user_text.lower()
+
     cnt_m = re.search(r"\b(?:top|best)\s+(\d{1,2})\b", low)
     limit = min(int(cnt_m.group(1)), 20) if cnt_m else 10
     years = [int(y) for y in re.findall(r"\b(19[5-9]\d|20[0-3]\d)\b", low)]
@@ -854,11 +866,79 @@ async def tmdb_smart_list_fallback(user_text: str) -> list:
         pass
     return tasks
 
+def local_commander_fallback(user_msg: str) -> dict:
+    """Built-in conversational brain so normal chat NEVER queues random movies even if Gemini is offline."""
+    low = (user_msg or "").lower().strip()
+    c_yr, c_pg, c_kind = get_crawler_progress()
+    q_preview = ", ".join(t[0]["raw"] if isinstance(t[0], dict) else str(t[0]) for t in list(TITLE_QUEUE)[:5]) or "None"
+
+    if any(w in low for w in ["what are you downloading", "downloading right now", "working on", "status", "queue"]):
+        return {
+            "action": "CHAT_ONLY",
+            "risk_level": "LOW",
+            "reply": (
+                f"<b>Here is what I am working on right now:</b>\n"
+                f"• <b>Currently Downloading:</b> <code>{ACTIVE_CLEAN_TITLE or 'Idle'}</code> ({ACTIVE_RES_TAG or '-'})\n"
+                f"• <b>Waiting in Queue ({len(TITLE_QUEUE)}):</b> <code>{q_preview}</code>\n"
+                f"• <b>24/7 Auto-Crawler:</b> <code>{'ON 🟢' if AUTO_DISCOVERY_ENABLED else 'OFF 🔴'}</code> (Year {c_yr} • {c_kind.upper()})\n"
+                f"• <b>Gemini Keys Loaded:</b> <code>{len(GEMINI_KEYS)}</code> (Status: <code>{LAST_GEMINI_ERROR}</code>)"
+            )
+        }
+
+    if any(w in low for w in ["tell me about u", "tell me about you", "who are you", "what are you", "what can you do", "hey", "hello", "hi"]):
+        return {
+            "action": "CHAT_ONLY",
+            "risk_level": "LOW",
+            "reply": (
+                "<b>I am THE BACKROOM AI COMMANDER</b> — your personal AI assistant living inside your Telegram account.\n\n"
+                "<b>What I can do:</b>\n"
+                "• 🎬 <b>Media Automation:</b> Search, download & organize Movies, Series & Anime across up to 30 Genre Vault channels with Official Public Names.\n"
+                "• 📜 <b>Permanent Rules:</b> Tell me <i>\"From now on...\"</i> and I will permanently remember and obey your rules.\n"
+                "• 🔍 <b>Account Intelligence:</b> Search across all your Telegram chats and messages.\n"
+                "• 🌐 <b>Website Sync:</b> Check website health or re-upload files so your website detects them.\n"
+                "• 🛠️ <b>Full Channel Control:</b> Create, rename, rebuild, or delete channels.\n\n"
+                f"<i>(Active Gemini Keys: <code>{len(GEMINI_KEYS)}</code> | Status: <code>{LAST_GEMINI_ERROR}</code>)</i>"
+            )
+        }
+
+    if low.startswith(("from now on", "always ", "never ", "remember that")):
+        return {
+            "action": "MANAGE_RULE",
+            "risk_level": "LOW",
+            "rule_op": "ADD",
+            "rule_text": user_msg.strip(),
+            "reply": f"Saved as a permanent behavioral rule: <code>{user_msg.strip()}</code>"
+        }
+
+    if low.startswith(("remove ", "delete movie ", "delete series ")):
+        t_del = re.sub(r"^(?:remove|delete)\s+(?:the\s+)?(?:movie|series)?\s*", "", user_msg, flags=re.I).strip()
+        return {
+            "action": "DELETE_MEDIA",
+            "risk_level": "MEDIUM",
+            "target_title": t_del,
+            "reply": f"Removing all files and cards for <code>{t_del}</code>..."
+        }
+
+    if low.startswith(("reupload ", "re-upload ", "resync ")):
+        t_re = re.sub(r"^(?:reupload|re-upload|resync)\s+", "", user_msg, flags=re.I).strip()
+        return {
+            "action": "REUPLOAD_MEDIA",
+            "risk_level": "MEDIUM",
+            "target_title": t_re,
+            "reply": f"Re-uploading <code>{t_re}</code> as a brand-new post with its Official Public Name..."
+        }
+
+    return {
+        "action": "CHAT_ONLY",
+        "risk_level": "LOW",
+        "reply": (
+            f"I received your message: <code>{user_msg}</code>\n\n"
+            f"⚠️ <b>Gemini API Status:</b> <code>{LAST_GEMINI_ERROR}</code>\n"
+            f"• Send <code>.addgemini AIzaSyYourKey</code> to connect a working Gemini key, or use <code>.search Title</code> to download a movie/series!"
+        )
+    }
+
 async def gemini_interactive_agent(user_msg: str) -> dict:
-    """
-    THE BACKROOM AI COMMANDER Central Orchestrator:
-    Injects Active Permanent Rules + Long-Term Memories + Live System State into every decision.
-    """
     ch_map = load_all_channels_from_db()
     c_yr, c_pg, c_kind = get_crawler_progress()
     active_rules = get_active_behavior_rules()
@@ -887,13 +967,14 @@ async def gemini_interactive_agent(user_msg: str) -> dict:
     OWNER MESSAGE: "{user_msg}"
 
     Determine the owner's intent and select the appropriate action:
-    1. If the owner gives a permanent instruction ("From now on...", "Always...", "Never...", "Remember that I prefer..."), set action="MANAGE_RULE", rule_op="ADD" (or "UPDATE"/"REMOVE"/"RESTORE"), and rule_text="<clean rule>".
-    2. If the owner shares a preference or project note to remember, also populate memory_to_save={{"category": "preference|project", "key": "...", "value": "..."}}.
-    3. If the owner asks to search their Telegram account/chats ("Find the conversation where I discussed...", "Search my messages for..."), set action="SEARCH_ACCOUNT" and search_query="<keywords>".
-    4. If the owner asks to investigate why the website isn't displaying files or check website health, set action="INSPECT_WEBSITE" and target_title="<title or null>".
-    5. If the owner asks you to evolve/create a new capability or plugin ("Create a capability that...", "Improve your duplicate detection..."), set action="SELF_EVOLVE", cap_name="snake_case_name", cap_description="...", and cap_code="valid python function code".
-    6. If the owner asks to schedule a recurring job ("Check website sync every 30 minutes"), set action="SCHEDULE_JOB", schedule_prompt="...", interval_minutes=30.
-    7. Full Telegram & Media Controls:
+    1. If the owner is chatting or asking a question ("Hey, what are you downloading right now?", "Tell me about u"), answer naturally and set action="CHAT_ONLY". NEVER queue movies when the owner is just chatting!
+    2. If the owner gives a permanent instruction ("From now on...", "Always...", "Never...", "Remember that I prefer..."), set action="MANAGE_RULE", rule_op="ADD" (or "UPDATE"/"REMOVE"/"RESTORE"), and rule_text="<clean rule>".
+    3. If the owner shares a preference or project note to remember, also populate memory_to_save={{"category": "preference|project", "key": "...", "value": "..."}}.
+    4. If the owner asks to search their Telegram account/chats ("Find the conversation where I discussed...", "Search my messages for..."), set action="SEARCH_ACCOUNT" and search_query="<keywords>".
+    5. If the owner asks to investigate why the website isn't displaying files or check website health, set action="INSPECT_WEBSITE" and target_title="<title or null>".
+    6. If the owner asks you to evolve/create a new capability or plugin ("Create a capability that...", "Improve your duplicate detection..."), set action="SELF_EVOLVE", cap_name="snake_case_name", cap_description="...", and cap_code="valid python function code".
+    7. If the owner asks to schedule a recurring job ("Check website sync every 30 minutes"), set action="SCHEDULE_JOB", schedule_prompt="...", interval_minutes=30.
+    8. Full Telegram & Media Controls:
        - "QUEUE_TITLES" (populate "tasks")
        - "DELETE_MEDIA" (target_title)
        - "REUPLOAD_MEDIA" (target_title)
@@ -910,28 +991,40 @@ async def gemini_interactive_agent(user_msg: str) -> dict:
     {{
       "reply": "Detailed, natural HTML-formatted response",
       "action": "CHAT_ONLY",
-      "risk_level": "LOW" | "MEDIUM" | "HIGH",
-      "rule_op": null or "ADD" | "UPDATE" | "REMOVE" | "RESTORE",
-      "rule_id": null or integer,
-      "rule_text": null or string,
-      "memory_to_save": null or {{"category": "preference", "key": "...", "value": "..."}},
-      "search_query": null or string,
-      "cap_name": null or string,
-      "cap_description": null or string,
-      "cap_code": null or string,
-      "schedule_prompt": null or string,
-      "interval_minutes": null or integer,
-      "target_channel_key": null or string,
-      "new_name": null or string,
-      "target_title": null or string,
-      "crawler_year": null or integer,
-      "crawler_mode": null or string,
-      "crawler_on": null or boolean,
-      "tasks": [{{"raw": "Title", "title": "Popular Title", "year": null, "mode": "normal", "season": null, "episodes": null}}]
+      "risk_level": "LOW",
+      "rule_op": null,
+      "rule_id": null,
+      "rule_text": null,
+      "memory_to_save": null,
+      "search_query": null,
+      "cap_name": null,
+      "cap_description": null,
+      "cap_code": null,
+      "schedule_prompt": null,
+      "interval_minutes": null,
+      "target_channel_key": null,
+      "new_name": null,
+      "target_title": null,
+      "crawler_year": null,
+      "crawler_mode": null,
+      "crawler_on": null,
+      "tasks": []
     }}
     """
     res = await ask_gemini_json(prompt)
-    return res if (isinstance(res, dict) and res.get("action")) else None
+    if isinstance(res, dict) and res.get("action"):
+        return res
+
+    top_tasks = await tmdb_smart_list_fallback(user_msg)
+    if top_tasks:
+        return {
+            "action": "QUEUE_TITLES",
+            "risk_level": "LOW",
+            "reply": f"Queued <b>{len(top_tasks)}</b> titles from TMDB Discover!",
+            "tasks": top_tasks
+        }
+
+    return local_commander_fallback(user_msg)
 
 async def gemini_resolve_movie_meta(raw_title: str, target_year: int = None) -> dict:
     clean_k = normalize_title_key(raw_title)
