@@ -1,20 +1,4 @@
-Phase 0: Architecture & Dependency Audit Summary
 
-[Owner in Saved Messages] 
-       │ (Owner-Only Auth + Prompt-Injection Guard)
-       ▼
-[THE BACKROOM AI COMMANDER Orchestrator (gemini_interactive_agent)]
-  ├──► 1. Permanent Behavioral Rules Engine (SQLite: behavior_rules + rule_versions)
-  ├──► 2. Long-Term Memory Engine (SQLite: long_term_memory — Preferences/Projects/Ops)
-  ├──► 3. Structured Tool Registry & Risk Gate (LOW / MEDIUM / HIGH Confirmation + Audit Log)
-  ├──► 4. Telegram Account Intelligence (Read-Only Cross-Chat/Dialog/Media Search)
-  ├──► 5. Self-Evolution & Self-Development Engine (AST Check ➔ Backup ➔ Approval ➔ Rollback + Plugins)
-  ├──► 6. Website Intelligence Engine (Read-Only Web.js / Worker Health & Ingestion Audit)
-  ├──► 7. Natural-Language Scheduler Engine (SQLite: scheduled_jobs)
-  └──► 8. Existing Media Pipeline (100% Preserved: @fileserverxrobot ➔ @Hislordship_Movies_bot,
-          3-Bot Pool, 28 Genre Vaults, Series Index Quality Picker, Official Public Names)
-
-Complete Unified userbot_bridge.py — THE BACKROOM AI COMMANDER (Full Unbroken File)
 
 import os, sys, re, ast, json, shutil, asyncio, sqlite3, traceback
 from datetime import datetime, timezone
