@@ -771,260 +771,226 @@ def save_db_cached_meta(cache_key: str, data: dict):
 init_storage_db()
 
 # ============================================================================
-# 4. THE BACKROOM AI COMMANDER BRAIN (RULES + MEMORY + SELF-EVOLUTION + TOOLS)
+# 4. PURE REAL-TIME GEMINI AI BRAIN (ZERO HARD-CODED REPLIES + MULTI-ACTION)
 # ============================================================================
 LAST_GEMINI_ERROR = "None"
+WORKING_GEMINI_MODEL = None
+CANDIDATE_GEMINI_MODELS = []
 
-async def ask_gemini_json(prompt: str, cache_key: str = None):
-    global GEMINI_KEY_INDEX, GEMINI_CALL_COUNT, LAST_GEMINI_ERROR
+async def resolve_working_gemini_model(session: aiohttp.ClientSession, api_key: str) -> list:
+    """
+    Fetches the live model list from Google for your API key and orders active
+    Flash & Pro models so we never hit HTTP 404 on retired model names.
+    """
+    global CANDIDATE_GEMINI_MODELS
+    if CANDIDATE_GEMINI_MODELS:
+        return CANDIDATE_GEMINI_MODELS
+
+    fallback_models = [
+        "gemini-2.5-flash",
+        "gemini-2.5-pro",
+        "gemini-2.0-flash",
+        "gemini-1.5-flash-latest",
+        "gemini-pro"
+    ]
+    try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models?pageSize=100&key={api_key}"
+        async with session.get(url, timeout=8) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                flash_list, pro_list = [], []
+                skip_tags = ("embedding", "aqa", "imagen", "veo", "tts", "audio", "Dialog", "vision", "robotics", "computer-use", "learnlm")
+                for m in (data.get("models") or []):
+                    methods = m.get("supportedGenerationMethods") or []
+                    if "generateContent" not in methods:
+                        continue
+                    name = (m.get("name") or "").replace("models/", "").strip()
+                    if not name or any(s.lower() in name.lower() for s in skip_tags):
+                        continue
+                    if "flash" in name.lower() and "lite" not in name.lower():
+                        flash_list.append(name)
+                    elif "pro" in name.lower() or "flash" in name.lower():
+                        pro_list.append(name)
+                flash_list.sort(reverse=True)
+                pro_list.sort(reverse=True)
+                combined = flash_list + pro_list
+                if combined:
+                    CANDIDATE_GEMINI_MODELS = combined
+                    print(f"✅ Live Gemini Models Discovered on Key: {CANDIDATE_GEMINI_MODELS[:6]}")
+                    return CANDIDATE_GEMINI_MODELS
+    except Exception:
+        pass
+    return fallback_models
+
+async def call_gemini_raw(prompt: str) -> str:
+    """
+    Calls the live Gemini API without restrictive MIME locks that cause HTTP 400/404,
+    remembers WORKING_GEMINI_MODEL for instant replies, and rotates keys automatically.
+    """
+    global GEMINI_KEY_INDEX, GEMINI_CALL_COUNT, LAST_GEMINI_ERROR, WORKING_GEMINI_MODEL
     if not GEMINI_KEYS:
-        LAST_GEMINI_ERROR = "No GEMINI_API_KEY loaded (send .addgemini AIzaSy...)"
-        return None
-    if cache_key:
-        cached = get_db_cached_meta(f"gemini:{cache_key}")
-        if cached:
-            return cached
+        LAST_GEMINI_ERROR = "No GEMINI_API_KEY configured! Send: .addgemini AIzaSy..."
+        return ""
 
     async with GEMINI_SEMAPHORE:
         payload = {
             "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0.15, "responseMimeType": "application/json"}
+            "generationConfig": {"temperature": 0.25}
         }
         async with aiohttp.ClientSession() as session:
             for _ in range(len(GEMINI_KEYS)):
                 api_key = GEMINI_KEYS[GEMINI_KEY_INDEX % len(GEMINI_KEYS)]
                 GEMINI_KEY_INDEX += 1
-                for model in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.0-flash-lite"]:
+                models = await resolve_working_gemini_model(session, api_key)
+                if WORKING_GEMINI_MODEL and WORKING_GEMINI_MODEL in models:
+                    models = [WORKING_GEMINI_MODEL] + [m for m in models if m != WORKING_GEMINI_MODEL]
+
+                for model in models[:8]:
                     try:
                         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-                        async with session.post(url, json=payload, timeout=14) as resp:
+                        async with session.post(url, json=payload, timeout=16) as resp:
                             if resp.status == 200:
                                 GEMINI_CALL_COUNT += 1
+                                WORKING_GEMINI_MODEL = model
+                                LAST_GEMINI_ERROR = f"Connected ({model})"
                                 data = await resp.json()
                                 parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
-                                raw_txt = ""
+                                out_txt = ""
                                 for p in parts:
                                     if not p.get("thought") and p.get("text"):
-                                        raw_txt += p["text"]
-                                m_json = re.search(r"(\{.*\}|\[.*\])", raw_txt.strip(), re.DOTALL)
-                                if m_json:
-                                    parsed = json.loads(m_json.group(1))
-                                    if cache_key and parsed:
-                                        save_db_cached_meta(f"gemini:{cache_key}", parsed)
-                                    LAST_GEMINI_ERROR = "OK"
-                                    await asyncio.sleep(1.0)
-                                    return parsed
+                                        out_txt += p["text"]
+                                if out_txt.strip():
+                                    return out_txt.strip()
+                            elif resp.status == 404:
+                                if WORKING_GEMINI_MODEL == model:
+                                    WORKING_GEMINI_MODEL = None
+                                continue
+                            elif resp.status in (429, 403):
+                                LAST_GEMINI_ERROR = f"HTTP {resp.status} on {model} (rotating key)"
+                                break
                             else:
-                                err_body = await resp.text()
-                                LAST_GEMINI_ERROR = f"HTTP {resp.status} ({model})"
-                                if resp.status in (429, 403, 400):
-                                    break
+                                LAST_GEMINI_ERROR = f"HTTP {resp.status} on {model}"
                     except Exception as e:
                         LAST_GEMINI_ERROR = str(e)[:80]
-    return None
+    return ""
 
-async def tmdb_smart_list_fallback(user_text: str) -> list:
-    """Strictly triggers ONLY when user explicitly asks for 'top X' or 'best X' movies/series!"""
-    low = (user_text or "").lower().strip()
-    if not re.search(r"\b(?:top|best)\s+\d{1,2}\b", low):
-        return []
-    if not TMDB_API_KEY:
-        return []
+async def ask_gemini_json(prompt: str, cache_key: str = None):
+    if cache_key:
+        cached = get_db_cached_meta(f"gemini:{cache_key}")
+        if cached:
+            return cached
+    raw_txt = await call_gemini_raw(prompt)
+    if not raw_txt:
+        return None
+    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_txt.strip(), flags=re.I)
+    m_json = re.search(r"(\{.*\}|\[.*\])", cleaned, re.DOTALL)
+    if m_json:
+        try:
+            parsed = json.loads(m_json.group(1))
+            if cache_key and parsed:
+                save_db_cached_meta(f"gemini:{cache_key}", parsed)
+            return parsed
+        except Exception:
+            pass
+    return {"reply": raw_txt, "actions": [{"action": "CHAT_ONLY"}]}
 
-    cnt_m = re.search(r"\b(?:top|best)\s+(\d{1,2})\b", low)
-    limit = min(int(cnt_m.group(1)), 20) if cnt_m else 10
-    years = [int(y) for y in re.findall(r"\b(19[5-9]\d|20[0-3]\d)\b", low)]
-    yr_start = min(years) if years else current_utc_year()
-    yr_end = max(years) if len(years) > 1 else yr_start
-    is_tv = any(w in low for w in ["series", "shows", "anime", "k-drama", "kdrama", "season"])
-    endpoint = "tv" if is_tv else "movie"
-    genre_map_kw = {
-        "sci-fi": "878", "scifi": "878", "science fiction": "878", "horror": "27",
-        "thriller": "53", "action": "28", "comedy": "35", "romance": "10749",
-        "animation": "16", "anime": "16", "crime": "80", "drama": "18",
-        "fantasy": "14", "adventure": "12", "mystery": "9648", "documentary": "99", "war": "10752"
-    }
-    g_ids = [gid for kw, gid in genre_map_kw.items() if kw in low]
-    g_param = f"&with_genres={'|'.join(set(g_ids))}" if g_ids else ""
-    lang_param = "&with_original_language=ja" if "anime" in low else ("&with_original_language=ko" if "korean" in low else ("&with_original_language=hi|ta|te|ml" if any(w in low for w in ["bollywood", "hindi", "indian"]) else ""))
-    sort_p = "&sort_by=vote_average.desc&vote_count.gte=50" if ("highest" in low or "rated" in low) else "&sort_by=popularity.desc"
-    d_gte = "first_air_date.gte" if is_tv else "primary_release_date.gte"
-    d_lte = "first_air_date.lte" if is_tv else "primary_release_date.lte"
-    url = f"https://api.themoviedb.org/3/discover/{endpoint}?api_key={TMDB_API_KEY}&language=en-US&{d_gte}={yr_start}-01-01&{d_lte}={yr_end}-12-31{sort_p}{g_param}{lang_param}&page=1"
-    tasks = []
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=5) as r:
-                if r.status == 200:
-                    for it in ((await r.json()).get("results") or [])[:limit]:
-                        name = it.get("title") or it.get("name")
-                        rel = it.get("release_date") or it.get("first_air_date") or ""
-                        yr = int(rel[:4]) if len(rel) >= 4 and rel[:4].isdigit() else None
-                        if name:
-                            tasks.append({"raw": f"{name} ({yr})" if yr else name, "title": name, "year": None if is_tv else yr, "mode": "normal", "season": None, "episodes": None})
-    except Exception:
-        pass
-    return tasks
-
-def local_commander_fallback(user_msg: str) -> dict:
-    """Built-in conversational brain so normal chat NEVER queues random movies even if Gemini is offline."""
-    low = (user_msg or "").lower().strip()
+def get_live_system_snapshot() -> dict:
+    """Collects real-time stats from SQLite, queues, crawler, and channels for the AI."""
+    conn = sqlite3.connect("storage_index.db")
+    total_files = conn.execute("SELECT COUNT(*) FROM indexed_files_v4 WHERE message_id > 0").fetchone()[0]
+    recent_files = [
+        f"{r[0]} ({r[1]} {r[2]})"
+        for r in conn.execute("SELECT clean_title, ep_tag, res_tag FROM indexed_files_v4 ORDER BY id DESC LIMIT 8").fetchall()
+    ]
+    conn.close()
     c_yr, c_pg, c_kind = get_crawler_progress()
-    q_preview = ", ".join(t[0]["raw"] if isinstance(t[0], dict) else str(t[0]) for t in list(TITLE_QUEUE)[:5]) or "None"
-
-    if any(w in low for w in ["what are you downloading", "downloading right now", "working on", "status", "queue"]):
-        return {
-            "action": "CHAT_ONLY",
-            "risk_level": "LOW",
-            "reply": (
-                f"<b>Here is what I am working on right now:</b>\n"
-                f"• <b>Currently Downloading:</b> <code>{ACTIVE_CLEAN_TITLE or 'Idle'}</code> ({ACTIVE_RES_TAG or '-'})\n"
-                f"• <b>Waiting in Queue ({len(TITLE_QUEUE)}):</b> <code>{q_preview}</code>\n"
-                f"• <b>24/7 Auto-Crawler:</b> <code>{'ON 🟢' if AUTO_DISCOVERY_ENABLED else 'OFF 🔴'}</code> (Year {c_yr} • {c_kind.upper()})\n"
-                f"• <b>Gemini Keys Loaded:</b> <code>{len(GEMINI_KEYS)}</code> (Status: <code>{LAST_GEMINI_ERROR}</code>)"
-            )
-        }
-
-    if any(w in low for w in ["tell me about u", "tell me about you", "who are you", "what are you", "what can you do", "hey", "hello", "hi"]):
-        return {
-            "action": "CHAT_ONLY",
-            "risk_level": "LOW",
-            "reply": (
-                "<b>I am THE BACKROOM AI COMMANDER</b> — your personal AI assistant living inside your Telegram account.\n\n"
-                "<b>What I can do:</b>\n"
-                "• 🎬 <b>Media Automation:</b> Search, download & organize Movies, Series & Anime across up to 30 Genre Vault channels with Official Public Names.\n"
-                "• 📜 <b>Permanent Rules:</b> Tell me <i>\"From now on...\"</i> and I will permanently remember and obey your rules.\n"
-                "• 🔍 <b>Account Intelligence:</b> Search across all your Telegram chats and messages.\n"
-                "• 🌐 <b>Website Sync:</b> Check website health or re-upload files so your website detects them.\n"
-                "• 🛠️ <b>Full Channel Control:</b> Create, rename, rebuild, or delete channels.\n\n"
-                f"<i>(Active Gemini Keys: <code>{len(GEMINI_KEYS)}</code> | Status: <code>{LAST_GEMINI_ERROR}</code>)</i>"
-            )
-        }
-
-    if low.startswith(("from now on", "always ", "never ", "remember that")):
-        return {
-            "action": "MANAGE_RULE",
-            "risk_level": "LOW",
-            "rule_op": "ADD",
-            "rule_text": user_msg.strip(),
-            "reply": f"Saved as a permanent behavioral rule: <code>{user_msg.strip()}</code>"
-        }
-
-    if low.startswith(("remove ", "delete movie ", "delete series ")):
-        t_del = re.sub(r"^(?:remove|delete)\s+(?:the\s+)?(?:movie|series)?\s*", "", user_msg, flags=re.I).strip()
-        return {
-            "action": "DELETE_MEDIA",
-            "risk_level": "MEDIUM",
-            "target_title": t_del,
-            "reply": f"Removing all files and cards for <code>{t_del}</code>..."
-        }
-
-    if low.startswith(("reupload ", "re-upload ", "resync ")):
-        t_re = re.sub(r"^(?:reupload|re-upload|resync)\s+", "", user_msg, flags=re.I).strip()
-        return {
-            "action": "REUPLOAD_MEDIA",
-            "risk_level": "MEDIUM",
-            "target_title": t_re,
-            "reply": f"Re-uploading <code>{t_re}</code> as a brand-new post with its Official Public Name..."
-        }
-
+    q_items = [t[0].get("raw", t[0].get("title", "")) if isinstance(t[0], dict) else str(t[0]) for t in list(TITLE_QUEUE)[:10]]
     return {
-        "action": "CHAT_ONLY",
-        "risk_level": "LOW",
-        "reply": (
-            f"I received your message: <code>{user_msg}</code>\n\n"
-            f"⚠️ <b>Gemini API Status:</b> <code>{LAST_GEMINI_ERROR}</code>\n"
-            f"• Send <code>.addgemini AIzaSyYourKey</code> to connect a working Gemini key, or use <code>.search Title</code> to download a movie/series!"
-        )
+        "utc_time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "pipeline_active": CURRENT_PIPELINE_ACTIVE,
+        "currently_downloading": ACTIVE_CLEAN_TITLE or "None (Idle)",
+        "active_resolution": ACTIVE_RES_TAG or "None",
+        "queue_count": len(TITLE_QUEUE),
+        "queued_titles": q_items,
+        "auto_crawler_enabled": AUTO_DISCOVERY_ENABLED,
+        "auto_crawler_position": f"Year {c_yr} • Category {c_kind.upper()} • Page {c_pg}",
+        "total_indexed_files": total_files,
+        "recently_published": recent_files,
+        "channels": load_all_channels_from_db(),
+        "delivery_bots": [b.get("username") for b in BOT_POOL],
+        "gemini_keys_count": len(GEMINI_KEYS)
     }
 
 async def gemini_interactive_agent(user_msg: str) -> dict:
-    ch_map = load_all_channels_from_db()
-    c_yr, c_pg, c_kind = get_crawler_progress()
+    """
+    Pure, unscripted AI brain — understands ANY message in ANY language, answers naturally
+    like ChatGPT/Gemini, and can execute 1 or multiple real-time actions on your userbot.
+    """
+    snapshot = get_live_system_snapshot()
     active_rules = get_active_behavior_rules()
-    rules_str = "\n".join(f"  [Rule #{r[0]} v{r[3]}]: {r[1]}" for r in active_rules) or "  (No custom rules yet)"
-    memories = retrieve_relevant_memories(user_msg, limit=10)
-    mem_str = "\n".join(f"  [{m[0]}] {m[1]}: {m[2]}" for m in memories) or "  (No stored memories yet)"
+    rules_str = "\n".join(f"  - Rule #{r[0]} (v{r[3]}): {r[1]}" for r in active_rules) or "  (None)"
+    memories = retrieve_relevant_memories(user_msg, limit=12)
+    mem_str = "\n".join(f"  - [{m[0]}] {m[1]}: {m[2]}" for m in memories) or "  (None)"
     history_str = "\n".join(AI_CHAT_HISTORY)
 
     prompt = f"""
-    You are THE BACKROOM AI COMMANDER — a persistent, self-evolving ChatGPT-style personal AI operating system inside the owner's Telegram account.
-    Current State:
-    - Active Download: {ACTIVE_CLEAN_TITLE or 'Idle'} ({ACTIVE_RES_TAG or '-'}) | Queue: {len(TITLE_QUEUE)}
-    - Auto-Crawler: {'ON' if AUTO_DISCOVERY_ENABLED else 'OFF'} (Year: {c_yr}, Category: {c_kind})
-    - Gemini Keys Pool: {len(GEMINI_KEYS)} | Delivery Bots: {len(BOT_POOL)}
-    - Channels (cat_key: channel_id): {json.dumps(ch_map)}
+    You are THE BACKROOM AI COMMANDER, a real-time conversational AI living inside the owner's Telegram Userbot.
+    Speak naturally, intelligently, and directly to the owner—like ChatGPT/Gemini. Never use robotic canned templates.
+    Understand any phrasing, slang, typos, or language (including English, Amharic, etc.).
 
-    ACTIVE PERMANENT BEHAVIORAL RULES (MUST OBEY):
+    REAL-TIME SYSTEM STATE RIGHT NOW:
+    {json.dumps(snapshot, indent=2)}
+
+    PERMANENT BEHAVIORAL RULES TAUGHT BY OWNER (ALWAYS OBEY):
     {rules_str}
 
-    RELEVANT LONG-TERM MEMORIES:
+    LONG-TERM MEMORIES:
     {mem_str}
 
-    RECENT CONVERSATION:
+    CONVERSATION HISTORY:
     {history_str}
 
-    OWNER MESSAGE: "{user_msg}"
+    OWNER'S NEW MESSAGE:
+    "{user_msg}"
 
-    Determine the owner's intent and select the appropriate action:
-    1. If the owner is chatting or asking a question ("Hey, what are you downloading right now?", "Tell me about u"), answer naturally and set action="CHAT_ONLY". NEVER queue movies when the owner is just chatting!
-    2. If the owner gives a permanent instruction ("From now on...", "Always...", "Never...", "Remember that I prefer..."), set action="MANAGE_RULE", rule_op="ADD" (or "UPDATE"/"REMOVE"/"RESTORE"), and rule_text="<clean rule>".
-    3. If the owner shares a preference or project note to remember, also populate memory_to_save={{"category": "preference|project", "key": "...", "value": "..."}}.
-    4. If the owner asks to search their Telegram account/chats ("Find the conversation where I discussed...", "Search my messages for..."), set action="SEARCH_ACCOUNT" and search_query="<keywords>".
-    5. If the owner asks to investigate why the website isn't displaying files or check website health, set action="INSPECT_WEBSITE" and target_title="<title or null>".
-    6. If the owner asks you to evolve/create a new capability or plugin ("Create a capability that...", "Improve your duplicate detection..."), set action="SELF_EVOLVE", cap_name="snake_case_name", cap_description="...", and cap_code="valid python function code".
-    7. If the owner asks to schedule a recurring job ("Check website sync every 30 minutes"), set action="SCHEDULE_JOB", schedule_prompt="...", interval_minutes=30.
-    8. Full Telegram & Media Controls:
-       - "QUEUE_TITLES" (populate "tasks")
-       - "DELETE_MEDIA" (target_title)
-       - "REUPLOAD_MEDIA" (target_title)
-       - "RENAME_ALL_PUBLIC"
-       - "REBUILD_SERIES_INDEX"
-       - "RENAME_CHANNEL" (target_channel_key, new_name)
-       - "DELETE_CHANNEL" (ask confirmation via CHAT_ONLY if ambiguous!)
-       - "CLEAR_CHANNEL_MESSAGES" (target_channel_key)
-       - "CREATE_CHANNEL" (target_channel_key)
-       - "CRAWLER_CONTROL" (crawler_on, crawler_year, crawler_mode)
-       - "SKIP" | "CLEAR_QUEUE" | "CHAT_ONLY"
+    AVAILABLE REAL-TIME ACTIONS YOU CAN TRIGGER (You can trigger 0, 1, or MULTIPLE actions in "actions"):
+    - {{"action": "CHAT_ONLY"}} -> Just talk/answer naturally without changing bot state.
+    - {{"action": "STOP_ALL"}} -> Immediately stop the current download, clear the queue, and pause the auto-crawler! (Use this whenever the owner says "stop anything on progress", "stop everything", "halt", "pause all", etc.)
+    - {{"action": "CRAWLER_CONTROL", "crawler_on": true/false, "crawler_year": 2026, "crawler_mode": "movie|anime|animation|bollywood|korean|turkish|amharic|horror|action|scifi|crime|tv"}} -> Turn auto-crawler on/off or change its year/category.
+    - {{"action": "SKIP"}} -> Skip only the currently downloading title and move to the next in queue.
+    - {{"action": "CLEAR_QUEUE"}} -> Clear all waiting items in the queue.
+    - {{"action": "QUEUE_TITLES", "tasks": [{{"raw": "Title", "title": "Official Title", "year": null, "mode": "normal|missing|range", "season": null, "episodes": null}}]}} -> Queue movies/series to download (only when owner asks to download/find movies or series!).
+    - {{"action": "DELETE_MEDIA", "target_title": "Title"}} -> Delete a movie/series from storage channels.
+    - {{"action": "REUPLOAD_MEDIA", "target_title": "Title or null for batch"}} -> Delete old copy and re-upload as brand-new post with Official Public Name for website sync.
+    - {{"action": "RENAME_ALL_PUBLIC"}} -> Rename & readjust all existing files in storage channels to Official Public Names.
+    - {{"action": "REBUILD_SERIES_INDEX"}} -> Wipe Series Index Channel and resend 1 clean Master Card per series.
+    - {{"action": "RENAME_CHANNEL", "target_channel_key": "old_name_or_key", "new_name": "New Channel Name"}} -> Rename a Telegram channel/chat.
+    - {{"action": "DELETE_CHANNEL", "target_channel_key": "exact_key_or_id"}} -> Delete a Telegram channel (if ambiguous, ask owner to confirm first using CHAT_ONLY!).
+    - {{"action": "CLEAR_CHANNEL_MESSAGES", "target_channel_key": "key_or_name"}} -> Delete messages inside a channel.
+    - {{"action": "CREATE_CHANNEL", "target_channel_key": "genre_key"}} -> Create a new storage channel.
+    - {{"action": "MANAGE_RULE", "rule_op": "ADD|UPDATE|REMOVE|RESTORE", "rule_text": "...", "rule_id": null}} -> Save/update a permanent behavioral rule.
+    - {{"action": "SAVE_MEMORY", "category": "preference|project", "key": "...", "value": "..."}} -> Save important info to long-term memory.
+    - {{"action": "SEARCH_ACCOUNT", "search_query": "..."}} -> Search across the owner's entire Telegram account chats/messages.
+    - {{"action": "INSPECT_WEBSITE", "target_title": "Title or null"}} -> Run read-only website & storage diagnostics.
+    - {{"action": "SELF_EVOLVE", "cap_name": "name", "cap_description": "...", "cap_code": "python code"}} -> Create & register a new Python capability plugin.
+    - {{"action": "SCHEDULE_JOB", "schedule_prompt": "...", "interval_minutes": 30}} -> Schedule a recurring task.
 
-    Return ONLY valid JSON:
+    Return a JSON object with:
     {{
-      "reply": "Detailed, natural HTML-formatted response",
-      "action": "CHAT_ONLY",
-      "risk_level": "LOW",
-      "rule_op": null,
-      "rule_id": null,
-      "rule_text": null,
-      "memory_to_save": null,
-      "search_query": null,
-      "cap_name": null,
-      "cap_description": null,
-      "cap_code": null,
-      "schedule_prompt": null,
-      "interval_minutes": null,
-      "target_channel_key": null,
-      "new_name": null,
-      "target_title": null,
-      "crawler_year": null,
-      "crawler_mode": null,
-      "crawler_on": null,
-      "tasks": []
+      "reply": "Your natural, intelligent HTML-formatted response to the owner",
+      "actions": [
+        {{"action": "..."}}
+      ]
     }}
     """
     res = await ask_gemini_json(prompt)
-    if isinstance(res, dict) and res.get("action"):
+    if isinstance(res, dict) and (res.get("reply") or res.get("actions") or res.get("action")):
         return res
 
-    top_tasks = await tmdb_smart_list_fallback(user_msg)
-    if top_tasks:
-        return {
-            "action": "QUEUE_TITLES",
-            "risk_level": "LOW",
-            "reply": f"Queued <b>{len(top_tasks)}</b> titles from TMDB Discover!",
-            "tasks": top_tasks
-        }
-
-    return local_commander_fallback(user_msg)
+    return {
+        "reply": f"⚠️ <b>Gemini API Connection Issue:</b> <code>{LAST_GEMINI_ERROR}</code>\nCheck your key or add a fresh one with <code>.addgemini AIzaSy...</code>",
+        "actions": [{"action": "CHAT_ONLY"}]
+    }
 
 async def gemini_resolve_movie_meta(raw_title: str, target_year: int = None) -> dict:
     clean_k = normalize_title_key(raw_title)
@@ -1183,7 +1149,7 @@ async def fetch_official_catalog(title: str) -> dict:
                 except Exception:
                     pass
     return {"seasons": seasons_map, "franchise_movies": franchise_movies[:12]}
-
+    
 # ============================================================================
 # 5. PUBLIC OFFICIAL NAME CAPTION BUILDER, 28-GENRE ROUTER & SERIES INDEX HUB
 # ============================================================================
