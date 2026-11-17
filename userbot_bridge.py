@@ -11,7 +11,10 @@ asyncio.set_event_loop(loop)
 from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError
-from telethon.tl.functions.channels import JoinChannelRequest, CreateChannelRequest, EditAdminRequest, DeleteChannelRequest
+from telethon.tl.functions.channels import (
+    JoinChannelRequest, CreateChannelRequest, EditAdminRequest,
+    DeleteChannelRequest, EditTitleRequest, LeaveChannelRequest
+)
 from telethon.tl.functions.messages import ImportChatInviteRequest, ToggleNoForwardsRequest
 from telethon.tl.types import ChatAdminRights
 
@@ -27,7 +30,6 @@ BOT_TOKEN_2 = os.environ.get("BOT_TOKEN_2", "").strip()
 BOT_TOKEN_3 = os.environ.get("BOT_TOKEN_3", "").strip()
 RAW_BOT_TOKENS = [t for t in [BOT_TOKEN, BOT_TOKEN_2, BOT_TOKEN_3] if t]
 
-# Collect unlimited Gemini API keys from GEMINI_API_KEY (comma-separated) + GEMINI_API_KEY_2..50
 GEMINI_KEYS = []
 for k_name, k_val in sorted(os.environ.items()):
     if k_name.startswith("GEMINI_API_KEY") and k_val.strip():
@@ -106,7 +108,7 @@ SYNCED_TITLES = set()
 DIALOG_CACHE_READY = False
 META_CACHE = {}
 TITLE_QUEUE = deque()
-AI_CHAT_HISTORY = deque(maxlen=12)
+AI_CHAT_HISTORY = deque(maxlen=14)
 BOT_POOL = []
 BOT_RR_INDEX = 0
 GEMINI_KEY_INDEX = 0
@@ -151,15 +153,8 @@ def pick_bot_for_role(role: str = "any") -> dict:
     return chosen
 
 # ============================================================================
-# 2. CLEAN TITLE, COPYRIGHT SHIELD & NATURAL LANGUAGE PARSER
+# 2. CLEAN OFFICIAL TITLE PARSER & COMMAND EXTRACTOR
 # ============================================================================
-def obfuscate_copyright_text(text: str) -> str:
-    if not text:
-        return ""
-    for word in ["BluRay", "WEB-DL", "WEBRip", "Netflix", "Marvel", "Disney", "Sony", "Warner"]:
-        text = re.sub(f"(?i)({word[:2]})({word[2:]})", r"\1&#8203;\2", text)
-    return text
-
 def extract_year_from_text(text: str):
     m = re.search(r"\b(19[5-9]\d|20[0-3]\d)\b", text or "")
     return int(m.group(1)) if m else None
@@ -168,17 +163,18 @@ def normalize_title_key(title: str) -> str:
     s = re.sub(r"['’`]", "", title or "")
     s = re.sub(r"[._\-·•]+", " ", s).strip()
     s = re.sub(r"^[^\w]+", "", s).strip()
-    yr_m = re.search(r"^(.{2,}?)\s+\b(?:19[5-9]\d|20[0-3]\d)\b", s)
-    if yr_m:
-        s = yr_m.group(1)
-    s = re.sub(
-        r"\b(S\d{1,2}|Season\s*\d+|E\d{1,3}|EP\.?\s*\d+|Episode\s*\d+|360p|480p|540p|720p|1080p|1440p|2160p|4K|BluRay|WEB-?DL|WEBRip|HDRip|NF|AMZN|DSNP|Pahe|MKV|MP4|HEVC|x265|x264|10Bit|6CH|8CH|AAC\d*|DDP\d*|ESub|Dual\s*Audio|Multi\s*Audio|Dubbed|Dub)\b.*$",
-        "", s, flags=re.I
+    # Cut off at year, season/episode, resolution, or rip tag so scene spam is 100% removed
+    cut_m = re.search(
+        r"^(.{2,}?)\s+\b(?:19[5-9]\d|20[0-3]\d|S\d{1,2}E\d{1,3}|S\d{1,2}|Season\s*\d+|E\d{1,3}|EP\.?\s*\d+|360p|480p|540p|720p|1080p|1440p|2160p|4K|BluRay|WEB-?DL|WEBRip|HDRip|DVDRip|CAMRip|HDTS)\b",
+        s, flags=re.I
     )
+    if cut_m:
+        s = cut_m.group(1)
+    s = re.sub(r"\b(NF|AMZN|DSNP|Pahe|MKV|MP4|HEVC|x265|x264|10Bit|6CH|8CH|AAC\d*|DDP\d*|ESub|Dual\s*Audio|Multi\s*Audio|Dubbed|Dub)\b.*$", "", s, flags=re.I)
     return re.sub(r"[^a-zA-Z0-9]+", " ", s).strip().lower() or "unknown"
 
 def make_slug_key(title: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", normalize_title_key(title))[:24] or "show"
+    return re.sub(r"[^a-z0-9]+", "", normalize_title_key(title))[:22] or "show"
 
 def is_strict_title_and_year_match(candidate_text: str, target_title: str, target_year: int = None) -> bool:
     cand_years = [int(y) for y in re.findall(r"\b(19[5-9]\d|20[0-3]\d)\b", candidate_text or "")]
@@ -196,14 +192,11 @@ def is_strict_title_and_year_match(candidate_text: str, target_title: str, targe
     return all(tw in cand_words or tw in compact_cand for tw in target_words)
 
 def parse_smart_user_command(raw_text: str) -> dict:
-    text = re.sub(r"^\.(?:get|ai)\s+", "", (raw_text or "").strip(), flags=re.I).strip()
+    text = re.sub(r"^\.(?:search|get|ai|s)\s+", "", (raw_text or "").strip(), flags=re.I).strip()
     text = re.sub(r"^[\d\-\*\•\.]+\s*", "", text).strip(" ,.;:")
     mode, season_num, target_episodes = "normal", None, set()
 
-    missing_m = re.match(
-        r"^(?:find\s+|check\s+|fill\s+|download\s+)?missing(?:\s+files?|\s+episodes?|\s+ep|\s+parts?|\s+movies?)?(?:\s+from|\s+in|\s+for|\s+of)?\s+(.+)$",
-        text, flags=re.I
-    )
+    missing_m = re.match(r"^(?:find\s+|check\s+|fill\s+|download\s+)?missing(?:\s+files?|\s+episodes?|\s+ep|\s+parts?|\s+movies?)?(?:\s+from|\s+in|\s+for|\s+of)?\s+(.+)$", text, flags=re.I)
     if missing_m:
         mode, text = "missing", missing_m.group(1).strip()
     elif re.search(r"\bmissing(?:\s+files?|\s+episodes?|\s+ep|\s+parts?)?\b$", text, flags=re.I):
@@ -239,8 +232,9 @@ def parse_smart_user_command(raw_text: str) -> dict:
     }
 
 def split_bulk_commands(raw_message: str) -> list:
+    msg = re.sub(r"^\.(?:search|get|s)\s+", "", (raw_message or "").strip(), flags=re.I).strip()
     commands = []
-    for line in (raw_message or "").splitlines():
+    for line in msg.splitlines():
         line = line.strip()
         if not line or re.match(r"^[\.\s,]+$", line):
             continue
@@ -253,7 +247,7 @@ def split_bulk_commands(raw_message: str) -> list:
     return commands
 
 # ============================================================================
-# 3. DATABASE & AUTO-DISCOVERY OF CREATED CHANNELS FROM TELEGRAM DIALOGS
+# 3. DATABASE, CHANNEL DIALOG SYNC & ACCOUNT CHANNEL MANAGER
 # ============================================================================
 def extract_resolution_tag(text: str, default_res: str = "HD") -> str:
     m = re.search(r"\b(360p|480p|540p|720p|1080p|1440p|2160p|4K)\b", text or "", re.I)
@@ -348,10 +342,6 @@ async def promote_all_bots_in_channel(channel_id: int):
                 pass
 
 async def sync_created_channels_from_dialogs():
-    """
-    Automatically finds all your created 'Vault • ...' and 'The Backroom • Series Season Index'
-    channels directly from your Telegram account dialogs so they are always linked even after Render restarts!
-    """
     global DIALOG_CACHE_READY, SERIES_INDEX_CHANNEL
     title_to_key = {v.lower(): k for k, v in DETAILED_GENRE_TITLES.items()}
     conn = sqlite3.connect("storage_index.db")
@@ -369,16 +359,80 @@ async def sync_created_channels_from_dialogs():
                     break
         conn.commit()
         DIALOG_CACHE_READY = True
-    except Exception as e:
-        print(f"⚠️ Dialog sync notice: {e}")
+    except Exception:
+        pass
     finally:
         conn.close()
+
+async def resolve_account_channel_target(target_str: str):
+    """Finds a channel in your Telegram account by cat_key, channel_id, or partial title name."""
+    t = (target_str or "").strip().lower()
+    if not t:
+        return []
+    ch_map = load_all_channels_from_db()
+    if t in ch_map:
+        return [(t, ch_map[t], DETAILED_GENRE_TITLES.get(t, t.upper()))]
+    matches = []
+    async for dlg in client.iter_dialogs(limit=250):
+        if not (dlg.is_channel or dlg.is_group):
+            continue
+        d_name = (dlg.name or "").strip()
+        if t == str(dlg.id) or t in d_name.lower():
+            matches.append((d_name, int(dlg.id), d_name))
+    return matches
+
+async def rename_telegram_channel_or_chat(target_str: str, new_title: str) -> str:
+    matches = await resolve_account_channel_target(target_str)
+    if not matches:
+        return f"⚠️ Could not find any channel/chat matching <code>{target_str}</code>."
+    _, cid, old_name = matches[0]
+    try:
+        await client(EditTitleRequest(channel=cid, title=new_title.strip()))
+        conn = sqlite3.connect("storage_index.db")
+        conn.execute("UPDATE dynamic_channels SET title=? WHERE channel_id=?", (new_title.strip(), cid))
+        conn.commit()
+        conn.close()
+        return f"✏️ <b>Renamed Chat:</b> <code>{old_name}</code> ➔ <code>{new_title.strip()}</code> (<code>{cid}</code>)"
+    except Exception as e:
+        return f"⚠️ Rename error: <code>{e}</code>"
+
+async def delete_movie_or_series_everywhere(query: str) -> int:
+    """Deletes a movie, series, or franchise from all storage channels, Series Index, and SQLite."""
+    await sync_created_channels_from_dialogs()
+    clean_q = normalize_title_key(query)
+    if not clean_q or clean_q == "unknown":
+        return 0
+    deleted_count = 0
+    ch_map = load_all_channels_from_db()
+    all_chs = sorted(list(set(ch_map.values())))
+
+    for cid in all_chs:
+        try:
+            to_del = []
+            async for m in client.iter_messages(cid, search=query, limit=60):
+                fn = (m.file.name if m.file else "") or ""
+                txt = f"{fn}\n{m.text or ''}"
+                if is_strict_title_and_year_match(txt, clean_q):
+                    to_del.append(m.id)
+            if to_del:
+                await client.delete_messages(cid, to_del)
+                deleted_count += len(to_del)
+        except Exception:
+            pass
+
+    slug = make_slug_key(clean_q)
+    conn = sqlite3.connect("storage_index.db")
+    conn.execute("DELETE FROM indexed_files_v4 WHERE clean_title=? OR slug_key=?", (clean_q, slug))
+    conn.execute("DELETE FROM series_index_cards WHERE slug_key=?", (slug,))
+    conn.execute("DELETE FROM crawler_history WHERE clean_title=?", (clean_q,))
+    conn.commit()
+    conn.close()
+    return deleted_count
 
 async def get_or_create_genre_channel(cat_key: str) -> int:
     ch_map = load_all_channels_from_db()
     if cat_key in ch_map and ch_map[cat_key]:
         return ch_map[cat_key]
-
     if not AUTO_CREATE_CHANNELS or count_unique_storage_channels() >= MAX_STORAGE_CHANNELS:
         fallback_map = {
             "scifi": "action", "adventure": "action", "war_history": "action",
@@ -447,16 +501,34 @@ def get_indexed_episodes_for_title(clean_title: str) -> set:
     conn.close()
     return {r[0] for r in rows}
 
-def get_season_messages_for_slug(slug_key: str, season_prefix: str) -> list:
+def get_season_messages_for_slug(slug_key: str, season_prefix: str, res_filter: str = None) -> list:
+    conn = sqlite3.connect("storage_index.db")
+    if res_filter and res_filter.upper() != "ALL":
+        rows = conn.execute(
+            """SELECT channel_id, message_id, ep_tag, res_tag FROM indexed_files_v4
+               WHERE slug_key=? AND ep_tag LIKE ? AND res_tag=? AND message_id > 0
+               GROUP BY ep_tag ORDER BY ep_tag ASC""",
+            (slug_key, f"{season_prefix.upper()}%", res_filter.upper())
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """SELECT channel_id, message_id, ep_tag, res_tag FROM indexed_files_v4
+               WHERE slug_key=? AND ep_tag LIKE ? AND message_id > 0
+               GROUP BY ep_tag, res_tag ORDER BY ep_tag ASC""",
+            (slug_key, f"{season_prefix.upper()}%")
+        ).fetchall()
+    conn.close()
+    return rows
+
+def get_available_season_qualities(slug_key: str, season_prefix: str) -> list:
     conn = sqlite3.connect("storage_index.db")
     rows = conn.execute(
-        """SELECT channel_id, message_id, ep_tag, res_tag FROM indexed_files_v4
-           WHERE slug_key=? AND ep_tag LIKE ? AND message_id > 0
-           GROUP BY ep_tag ORDER BY ep_tag ASC""",
+        "SELECT DISTINCT res_tag FROM indexed_files_v4 WHERE slug_key=? AND ep_tag LIKE ? AND message_id > 0",
         (slug_key, f"{season_prefix.upper()}%")
     ).fetchall()
     conn.close()
-    return rows
+    found = [r[0].upper() for r in rows if r[0]]
+    return sorted(found, key=lambda x: TARGET_RESOLUTIONS.index(x) if x in TARGET_RESOLUTIONS else 99)
 
 def get_crawler_progress():
     conn = sqlite3.connect("storage_index.db")
@@ -502,10 +574,9 @@ def save_db_cached_meta(cache_key: str, data: dict):
 init_storage_db()
 
 # ============================================================================
-# 4. MULTI-KEY GEMINI AI AGENT (INTERACTIVE CHAT + FULL USERBOT CONTROL)
+# 4. MULTI-KEY GEMINI AI CONTROLLER (FULL TELEGRAM ACCOUNT CONTROL)
 # ============================================================================
 async def ask_gemini_json(prompt: str, cache_key: str = None):
-    """Rotates across all configured GEMINI_KEYS automatically on 429/quota errors!"""
     global GEMINI_KEY_INDEX, GEMINI_CALL_COUNT
     if not GEMINI_KEYS:
         return None
@@ -539,10 +610,10 @@ async def ask_gemini_json(prompt: str, cache_key: str = None):
                                 parsed = json.loads(raw_txt)
                                 if cache_key and parsed:
                                     save_db_cached_meta(f"gemini:{cache_key}", parsed)
-                                await asyncio.sleep(1.5)
+                                await asyncio.sleep(1.2)
                                 return parsed
                             elif resp.status in (429, 403):
-                                break  # Rotate immediately to next backup Gemini key!
+                                break
                     except Exception:
                         pass
     return None
@@ -587,61 +658,54 @@ async def tmdb_smart_list_fallback(user_text: str) -> list:
     return tasks
 
 async def gemini_interactive_agent(user_msg: str) -> dict:
-    """
-    Conversational AI Controller with Memory & Full Userbot Action Control!
-    Can chat, ask confirmation (e.g. 'Which series channel do you want to delete?'),
-    or execute actions: QUEUE_TITLES, REBUILD_SERIES_INDEX, RESYNC_WEBSITE, READJUST_CHANNELS,
-    DELETE_CHANNEL, CLEAR_CHANNEL_MESSAGES, CREATE_CHANNEL, CRAWLER_CONTROL, SKIP, CLEAR_QUEUE, CHAT_ONLY.
-    """
     ch_map = load_all_channels_from_db()
     c_yr, c_pg, c_kind = get_crawler_progress()
     history_str = "\n".join(AI_CHAT_HISTORY)
 
     prompt = f"""
-    You are the interactive AI Controller for the user's Telegram Media Userbot.
-    Current Bot State:
+    You are the Interactive AI Master Controller for the user's Telegram Userbot & Account.
+    Live State:
     - Active Download: {ACTIVE_CLEAN_TITLE or 'Idle'} ({ACTIVE_RES_TAG or '-'})
     - Queue Length: {len(TITLE_QUEUE)}
     - Auto-Crawler: {'ON' if AUTO_DISCOVERY_ENABLED else 'OFF'} (Year: {c_yr}, Category: {c_kind})
-    - Gemini API Keys Loaded: {len(GEMINI_KEYS)}
-    - Configured Channels (cat_key: channel_id): {json.dumps(ch_map)}
+    - Gemini Keys Pool: {len(GEMINI_KEYS)} | Delivery Bots: {len(BOT_POOL)}
+    - Channels (cat_key: channel_id): {json.dumps(ch_map)}
 
-    Recent Conversation History:
+    Recent Chat History:
     {history_str}
 
-    User's New Message: "{user_msg}"
+    User's Message: "{user_msg}"
 
-    Rules:
-    1. If the user asks to delete a channel (e.g. "delete the series channel") and there are multiple matching channels (like 'series' and 'series_index') OR they haven't confirmed the exact cat_key yet, set action="CHAT_ONLY" and ask them clearly which exact channel ('series' or 'series_index') they want to delete, or if they just want to rebuild/clear its messages!
-    2. Only set action="DELETE_CHANNEL" if the user explicitly confirmed the exact channel key.
-    3. If the user asks to clean/resend/rebuild the series index channel (1 message per series), set action="REBUILD_SERIES_INDEX".
-    4. If the user asks to re-upload/resync a movie or series for their website, set action="RESYNC_WEBSITE" and target_title="<title or empty for batch>".
-    5. If the user asks to readjust/move movies to the new genre channels, set action="READJUST_CHANNELS".
-    6. If the user asks for movies/series (e.g. "Vikings", "top 10 sci-fi movies 2024-2026", "missing from Solo Leveling"), set action="QUEUE_TITLES" and populate "tasks" with real titles!
+    Instructions:
+    - If the user is just chatting, greeting, or asking a question, reply naturally and set action="CHAT_ONLY".
+    - Do NOT queue random chat words as movie searches! Only set action="QUEUE_TITLES" if the user asks to download/find movies or series.
+    - If the user says "remove/delete movie <title>", set action="DELETE_MEDIA" and target_title="<title>".
+    - If the user says "reupload <title>" (delete old & upload as new), set action="REUPLOAD_MEDIA" and target_title="<title>".
+    - If the user says "rename all files to public names" or "readjust", set action="RENAME_ALL_PUBLIC".
+    - If the user says "rename channel/chat <target> to <new_name>", set action="RENAME_CHANNEL", target_channel_key="<target>", new_name="<new_name>".
+    - If the user asks to delete a channel and it's ambiguous (e.g. 'series' vs 'series_index') or unconfirmed, set action="CHAT_ONLY" and ask which exact channel key to delete! Only set action="DELETE_CHANNEL" when confirmed.
+    - If the user asks to rebuild/clean the series index channel, set action="REBUILD_SERIES_INDEX".
 
-    Return ONLY a JSON object with this exact schema:
+    Return ONLY a JSON object:
     {{
-      "reply": "Friendly, detailed HTML-formatted response to send to the user",
-      "action": "CHAT_ONLY" | "QUEUE_TITLES" | "REBUILD_SERIES_INDEX" | "RESYNC_WEBSITE" | "READJUST_CHANNELS" | "DELETE_CHANNEL" | "CLEAR_CHANNEL_MESSAGES" | "CREATE_CHANNEL" | "CRAWLER_CONTROL" | "SKIP" | "CLEAR_QUEUE",
-      "target_channel_key": "cat_key if applicable else null",
-      "target_title": "title if applicable else null",
+      "reply": "Friendly HTML-formatted reply",
+      "action": "CHAT_ONLY" | "QUEUE_TITLES" | "DELETE_MEDIA" | "REUPLOAD_MEDIA" | "RENAME_ALL_PUBLIC" | "REBUILD_SERIES_INDEX" | "RENAME_CHANNEL" | "DELETE_CHANNEL" | "CLEAR_CHANNEL_MESSAGES" | "CREATE_CHANNEL" | "CRAWLER_CONTROL" | "SKIP" | "CLEAR_QUEUE",
+      "target_channel_key": null or "cat_key/name",
+      "new_name": null or "New Channel Title",
+      "target_title": null or "Movie/Series Title",
       "crawler_year": null or integer,
       "crawler_mode": null or string,
       "crawler_on": null or boolean,
-      "tasks": [
-        {{"raw": "Title (Year)", "title": "Exact Popular Title", "year": null, "mode": "normal", "season": null, "episodes": null}}
-      ]
+      "tasks": [{{"raw": "Title", "title": "Popular Title", "year": null, "mode": "normal", "season": null, "episodes": null}}]
     }}
     """
     res = await ask_gemini_json(prompt)
-    if isinstance(res, dict) and res.get("action"):
-        return res
-    return None
+    return res if (isinstance(res, dict) and res.get("action")) else None
 
 async def gemini_resolve_movie_meta(raw_title: str, target_year: int = None) -> dict:
     clean_k = normalize_title_key(raw_title)
-    prompt = f"""Identify movie/series: "{raw_title}" (Year hint: {target_year or 'Any'}).
-    Return JSON object: {{"public_title": "Official Popular English Title", "year": 2026, "genres": "Action, Sci-Fi", "language": "en", "rating": "7.8/10", "is_series": false}}"""
+    prompt = f"""Identify movie/series from: "{raw_title}" (Year hint: {target_year or 'Any'}).
+    Return JSON object: {{"public_title": "Official Popular Published English Title", "year": 2026, "genres": "Action, Sci-Fi", "language": "en", "rating": "7.8/10", "is_series": false}}"""
     return await ask_gemini_json(prompt, cache_key=f"meta:{clean_k}:{target_year or 'any'}")
 
 async def fetch_meta(title: str, target_year: int = None):
@@ -708,7 +772,7 @@ async def fetch_meta(title: str, target_year: int = None):
                     if r.status == 200:
                         data = await r.json()
                         if data.get("Response") == "True":
-                            if public_title.lower() == clean and data.get("Title"):
+                            if data.get("Title"):
                                 public_title = data["Title"]
                             y_str = re.search(r"\b(19\d\d|20\d\d)\b", data.get("Year", ""))
                             if y_str:
@@ -737,8 +801,8 @@ async def fetch_meta(title: str, target_year: int = None):
                             if target_year and iy and abs(iy - target_year) > 1:
                                 continue
                             if is_strict_title_and_year_match(t_name, clean, target_year):
-                                if public_title.lower() == clean and t_name:
-                                    public_title = t_name
+                                if t_name:
+                                    public_title = re.sub(r"\s*\(?\bSeason\s*\d+.*$", "", t_name, flags=re.I).strip()
                                 resolved_year = resolved_year or iy
                                 pg = item.get("primaryGenreName")
                                 if pg and pg not in genres_list:
@@ -797,7 +861,7 @@ async def fetch_official_catalog(title: str) -> dict:
     return {"seasons": seasons_map, "franchise_movies": franchise_movies[:12]}
 
 # ============================================================================
-# 5. CAPTION BUILDER, 28-CHANNEL GENRE ROUTER & SERIES INDEX REBUILDER
+# 5. PUBLIC OFFICIAL NAME CAPTION BUILDER, 28-GENRE ROUTER & SERIES INDEX HUB
 # ============================================================================
 def strip_subtitle_sections(caption: str) -> str:
     if not caption:
@@ -875,6 +939,7 @@ def extract_tech_specs(filename="", caption="", file_size_bytes=0, meta=None):
     }
 
 def build_final_caption(filename, caption, meta=None, file_size_bytes=0, ep_tag="MOVIE"):
+    """Always formats the post & File Name with the clean Official Public Published Name!"""
     meta = meta or {}
     sp = extract_tech_specs(filename, caption, file_size_bytes, meta)
     dur = sp["duration"] or meta.get("runtime", "")
@@ -884,7 +949,7 @@ def build_final_caption(filename, caption, meta=None, file_size_bytes=0, ep_tag=
     ep_str = f" - {ep_tag}" if ep_tag and ep_tag != "MOVIE" else ""
     dub_badge = " [Multi-Audio]" if sp["audio_tier"] == 3 else (" [Dual-Audio]" if sp["audio_tier"] == 2 else "")
     spec_tag = " ".join(p for p in [sp["quality"], sp["source"], sp["codec"]] if p)
-    clean_public_file = obfuscate_copyright_text(f"{pub_title}{year_str}{ep_str}{dub_badge} [{spec_tag}].mkv")
+    official_public_filename = f"{pub_title}{year_str}{ep_str}{dub_badge} [{spec_tag}].mkv"
 
     lines = [f"🎬 <b>{pub_title}{year_str}{ep_str}</b>"]
     if meta.get("genres") or meta.get("rating"):
@@ -892,10 +957,10 @@ def build_final_caption(filename, caption, meta=None, file_size_bytes=0, ep_tag=
         r_p = f"⭐ <b>{meta['rating']}</b>" if meta.get("rating") else ""
         lines.append(" • ".join(p for p in [g_p, r_p] if p))
 
-    lines.extend(["", "<b>File Name:</b>", f"<code>{clean_public_file}</code>", ""])
+    lines.extend(["", "<b>File Name:</b>", f"<code>{official_public_filename}</code>", ""])
     if dur:
         lines.append(f"<b>Duration:</b> {dur}")
-    spec_parts = [p for p in [sp["quality"], obfuscate_copyright_text(sp["source"]), sp["codec"], sp["size_str"]] if p]
+    spec_parts = [p for p in [sp["quality"], sp["source"], sp["codec"], sp["size_str"]] if p]
     lines.append(f"<b>Specs:</b> {' • '.join(spec_parts)}")
     if sp["audio_mode"]:
         lines.append(f"<b>Audio Track:</b> {sp['audio_mode']}")
@@ -908,7 +973,6 @@ def build_final_caption(filename, caption, meta=None, file_size_bytes=0, ep_tag=
     return "\n".join(lines)
 
 def detect_category(filename, caption, meta):
-    """Routes movies & series across all 28 detailed Genre & Industry Vault channels."""
     meta = meta or {}
     genres_low = (meta.get("genres") or "").lower()
     lang = (meta.get("language") or "").lower()
@@ -929,7 +993,6 @@ def detect_category(filename, caption, meta):
     if lang == "am" or re.search(r"[\u1200-\u137F]+|amharic|ትርጉም", f"{fn_low} {audio_line}"):
         return "amharic"
 
-    # Detailed Regional & Classic Vaults
     if lang in ("ta", "te", "ml", "kn") and "south_indian" in ch_map:
         return "south_indian"
     if lang in ("es", "fr", "de", "it") and "european" in ch_map:
@@ -937,7 +1000,6 @@ def detect_category(filename, caption, meta):
     if yr and int(yr) < 2000 and "classic_90s" in ch_map:
         return "classic_90s"
 
-    # Detailed Genre Vaults
     if "documentary" in genres_low and "documentary" in ch_map:
         return "documentary"
     if ("war" in genres_low or "history" in genres_low) and "war_history" in ch_map:
@@ -999,12 +1061,10 @@ async def publish_file_with_green_buttons(dest_channel: int, media, final_captio
 
 async def update_series_index_card(meta: dict, ep_tag: str, force_resend: bool = False):
     """
-    Guarantees 1 SINGLE CARD per series in The Backroom • Series Season Index!
-    If force_resend=True (or when rebuilding), deletes the old card for this series and sends 1 fresh card.
+    Posts/Updates 1 Single Master Card per Series in The Backroom • Series Season Index!
+    Links Season buttons across your 2 Delivery Bots (Bot 1 & Bot 2) so load is shared!
     """
-    series_bot = pick_bot_for_role("series")
-    token, b_uname = series_bot.get("token"), series_bot.get("username")
-    if not token or not b_uname or not ep_tag or ep_tag == "MOVIE":
+    if not BOT_POOL or not ep_tag or ep_tag == "MOVIE":
         return
 
     index_ch = SERIES_INDEX_CHANNEL or load_all_channels_from_db().get("series_index", 0)
@@ -1022,7 +1082,6 @@ async def update_series_index_card(meta: dict, ep_tag: str, force_resend: bool =
     existing_msg_id = row[0] if row else 0
     seasons_set = set(json.loads(row[1])) if row else set()
 
-    # Also check all seasons recorded in indexed_files_v4 for this slug
     db_ep_rows = conn.execute("SELECT DISTINCT substr(ep_tag, 1, 3) FROM indexed_files_v4 WHERE slug_key=? AND ep_tag LIKE 'S%'", (slug,)).fetchall()
     for r_ep in db_ep_rows:
         if r_ep[0]:
@@ -1030,17 +1089,26 @@ async def update_series_index_card(meta: dict, ep_tag: str, force_resend: bool =
     seasons_set.add(season_code)
     sorted_seasons = sorted(list(seasons_set))
 
-    season_rows, cur_row = [], []
-    for s_code in sorted_seasons:
+    # Build Season Buttons linking to your Delivery Bots (Bot 1 & Bot 2)
+    season_rows = []
+    active_bots = [b for b in BOT_POOL[:2] if b.get("username")]
+    for idx_s, s_code in enumerate(sorted_seasons):
         s_num = int(s_code[1:]) if s_code[1:].isdigit() else 1
-        ep_cnt = len(get_season_messages_for_slug(slug, s_code)) or 1
-        deep_link = f"https://t.me/{b_uname}?start=season_{slug}_{s_code}"
-        cur_row.append({"text": f"📺 Season {s_num:02d} ({ep_cnt} Ep) ↗", "url": deep_link, "style": "primary"})
-        if len(cur_row) == 2:
-            season_rows.append(cur_row)
-            cur_row = []
-    if cur_row:
-        season_rows.append(cur_row)
+        quals = get_available_season_qualities(slug, s_code)
+        q_str = "/".join(quals[:3]) if quals else "HD"
+        if len(active_bots) >= 2:
+            # Provide Server 1 (Bot 1) and Server 2 (Bot 2) buttons for each Season!
+            b1_u, b2_u = active_bots[0]["username"], active_bots[1]["username"]
+            season_rows.append([
+                {"text": f"📺 Season {s_num:02d} ({q_str}) • Bot 1 ↗", "url": f"https://t.me/{b1_u}?start=season_{slug}_{s_code}", "style": "primary"},
+                {"text": f"📺 Season {s_num:02d} • Bot 2 ↗", "url": f"https://t.me/{b2_u}?start=season_{slug}_{s_code}", "style": "primary"}
+            ])
+        elif active_bots:
+            b1_u = active_bots[0]["username"]
+            season_rows.append([
+                {"text": f"📺 Season {s_num:02d} ({q_str}) ↗", "url": f"https://t.me/{b1_u}?start=season_{slug}_{s_code}", "style": "primary"}
+            ])
+
     season_rows.append(GREEN_BRAND_ROW)
     markup = {"inline_keyboard": season_rows}
 
@@ -1049,9 +1117,10 @@ async def update_series_index_card(meta: dict, ep_tag: str, force_resend: bool =
         f"📺 <b>{pub_title}{yr_str}</b>\n"
         f"🎭 <b>Genre:</b> {meta.get('genres') or 'Series'} • ⭐ <b>{meta.get('rating') or 'HD'}</b>\n"
         f"📦 <b>Available Seasons:</b> <code>{', '.join(sorted_seasons)}</code>\n\n"
-        f"👇 <i>Tap a Season button below to get all episodes of that Season!</i>"
+        f"👇 <i>Tap a Season button below to choose your Quality (360p / 480p / 720p / 1080p) and get all episodes!</i>"
     )
 
+    token = BOT_POOL[0]["token"]
     try:
         if existing_msg_id and force_resend:
             try:
@@ -1080,24 +1149,18 @@ async def update_series_index_card(meta: dict, ep_tag: str, force_resend: bool =
                     msg_id = d["result"]["message_id"]
                     conn.execute("INSERT OR REPLACE INTO series_index_cards (slug_key, clean_title, public_title, index_channel_id, index_message_id, seasons_json) VALUES (?, ?, ?, ?, ?, ?)", (slug, clean_t, pub_title, index_ch, msg_id, json.dumps(sorted_seasons)))
                     conn.commit()
-    except Exception as e:
-        print(f"⚠️ Series Index Card notice: {e}")
+    except Exception:
+        pass
     finally:
         conn.close()
 
 async def rebuild_series_index_channel() -> int:
-    """
-    1. Deletes ALL messages inside The Backroom • Series Season Index.
-    2. Scans Series & Anime storage channels to index all stored episodes.
-    3. Sends 1 fresh Master Card per Series with colored Season buttons!
-    """
     await sync_created_channels_from_dialogs()
     ch_map = load_all_channels_from_db()
     index_ch = SERIES_INDEX_CHANNEL or ch_map.get("series_index", 0)
     if not index_ch or index_ch == DEFAULT_CHANNELS["other"]:
         return 0
 
-    # Step 1: Delete all existing messages in the Series Index Channel
     old_ids = []
     try:
         async for m in client.iter_messages(index_ch, limit=500):
@@ -1116,8 +1179,7 @@ async def rebuild_series_index_channel() -> int:
     conn.commit()
     conn.close()
 
-    # Step 2: Scan Series & Anime channels to discover all stored series episodes
-    series_map = {}  # {slug: (clean_title, set_of_ep_tags)}
+    series_map = {}
     for src_key in ("series", "anime"):
         cid = ch_map.get(src_key, DEFAULT_CHANNELS[src_key])
         try:
@@ -1142,7 +1204,6 @@ async def rebuild_series_index_channel() -> int:
         except Exception:
             pass
 
-    # Step 3: Send 1 fresh card per unique series
     sent_cards = 0
     for slug, (clean_t, ep_tags) in series_map.items():
         meta = await fetch_meta(clean_t)
@@ -1153,7 +1214,7 @@ async def rebuild_series_index_channel() -> int:
     return sent_cards
 
 # ============================================================================
-# 6. 3-BOT SEASON & MOVIE DELIVERY ENGINE
+# 6. 3-BOT INTERACTIVE QUALITY PICKER (360P / 480P / 720P / 1080P) & DELIVERY
 # ============================================================================
 async def recover_season_messages_from_channels(slug: str, s_code: str) -> list:
     conn = sqlite3.connect("storage_index.db")
@@ -1180,6 +1241,11 @@ async def recover_season_messages_from_channels(slug: str, s_code: str) -> list:
     return found
 
 async def poll_single_delivery_bot(bot_obj: dict):
+    """
+    1. When user clicks Season button (?start=season_<slug>_S01), sends an Inline Quality Picker
+       with colored buttons for 360P, 480P, 720P, 1080P, and 'Send All'!
+    2. When user clicks a Quality button (callback_query), forwards all episodes of that quality!
+    """
     token = bot_obj["token"]
     offset = 0
     async with aiohttp.ClientSession() as session:
@@ -1197,26 +1263,74 @@ async def poll_single_delivery_bot(bot_obj: dict):
                     data = await resp.json()
                     for upd in (data.get("result") or []):
                         offset = upd["update_id"] + 1
+
+                        # CASE A: User clicked an Inline Quality Button (360P / 480P / 720P / 1080P / ALL)
+                        cb = upd.get("callback_query")
+                        if cb:
+                            cb_id = cb.get("id")
+                            cb_data = cb.get("data") or ""
+                            chat_id = ((cb.get("message") or {}).get("chat") or {}).get("id")
+                            await session.post(f"https://api.telegram.org/bot{token}/answerCallbackQuery", data={"callback_query_id": cb_id, "text": "📥 Sending episodes..."})
+                            m_cb = re.match(r"^dlq_([a-z0-9]+)_(S\d{2})_([A-Z0-9]+)$", cb_data, re.I)
+                            if m_cb and chat_id:
+                                slug, s_code, q_choice = m_cb.group(1).lower(), m_cb.group(2).upper(), m_cb.group(3).upper()
+                                rows = get_season_messages_for_slug(slug, s_code, res_filter=q_choice)
+                                if not rows:
+                                    # Fallback to any available resolution if specific quality isn't stored yet
+                                    rows = get_season_messages_for_slug(slug, s_code, res_filter="ALL")
+                                await session.post(
+                                    f"https://api.telegram.org/bot{token}/sendMessage",
+                                    data={"chat_id": chat_id, "text": f"📺 <b>Delivering {len(rows)} episode file(s) for {s_code} ({q_choice})...</b>", "parse_mode": "HTML"}
+                                )
+                                for src_ch, src_msg_id, _, _ in rows:
+                                    await session.post(
+                                        f"https://api.telegram.org/bot{token}/copyMessage",
+                                        data={"chat_id": chat_id, "from_chat_id": src_ch, "message_id": src_msg_id, "reply_markup": json.dumps(GREEN_BOT_API_MARKUP)}
+                                    )
+                                    await asyncio.sleep(0.5)
+                            continue
+
+                        # CASE B: User opened Season Deep-Link (/start season_<slug>_S01) -> Show Quality Buttons!
                         msg = upd.get("message") or {}
                         text = (msg.get("text") or "").strip()
                         chat_id = (msg.get("chat") or {}).get("id")
                         if not chat_id or not text.startswith("/start"):
                             continue
+
                         m = re.match(r"^/start\s+season_([a-z0-9]+)_(S\d{2})", text, re.I)
                         if not m:
-                            await session.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": "🎬 <b>Welcome!</b> Tap any Season button in our Series Index Channel to receive all episodes instantly.", "parse_mode": "HTML"})
+                            await session.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": "🎬 <b>Welcome!</b> Tap any Season button in our Series Index Channel to choose your quality and receive episodes.", "parse_mode": "HTML"})
                             continue
+
                         slug, s_code = m.group(1).lower(), m.group(2).upper()
-                        rows = get_season_messages_for_slug(slug, s_code)
+                        rows = get_season_messages_for_slug(slug, s_code, res_filter="ALL")
                         if not rows:
                             rows = await recover_season_messages_from_channels(slug, s_code)
                         if not rows:
                             await session.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": f"⏳ Indexing episodes for <b>{s_code}</b> — please tap again in 1 minute!", "parse_mode": "HTML"})
                             continue
-                        await session.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": f"📺 <b>Delivering {len(rows)} episode(s) for {s_code}...</b>", "parse_mode": "HTML"})
-                        for src_ch, src_msg_id, _, _ in rows:
-                            await session.post(f"https://api.telegram.org/bot{token}/copyMessage", data={"chat_id": chat_id, "from_chat_id": src_ch, "message_id": src_msg_id, "reply_markup": json.dumps(GREEN_BOT_API_MARKUP)})
-                            await asyncio.sleep(0.5)
+
+                        avail_quals = get_available_season_qualities(slug, s_code) or ["1080P", "720P", "480P", "360P"]
+                        q_buttons, q_row = [], []
+                        for q_tag in ["360P", "480P", "720P", "1080P"]:
+                            badge = "✅" if q_tag in avail_quals else "🎞️"
+                            q_row.append({"text": f"{badge} {q_tag}", "callback_data": f"dlq_{slug}_{s_code}_{q_tag}", "style": "primary"})
+                            if len(q_row) == 2:
+                                q_buttons.append(q_row)
+                                q_row = []
+                        if q_row:
+                            q_buttons.append(q_row)
+                        q_buttons.append([{"text": f"📦 Send All Available ({len(rows)} Files)", "callback_data": f"dlq_{slug}_{s_code}_ALL", "style": "success"}])
+
+                        await session.post(
+                            f"https://api.telegram.org/bot{token}/sendMessage",
+                            data={
+                                "chat_id": chat_id,
+                                "text": f"📺 <b>Season {s_code[1:]} Quality Selector</b>\n✨ <b>Available Qualities:</b> <code>{', '.join(avail_quals)}</code>\n\n👇 <i>Select your preferred video resolution below:</i>",
+                                "parse_mode": "HTML",
+                                "reply_markup": json.dumps({"inline_keyboard": q_buttons})
+                            }
+                        )
             except Exception:
                 await asyncio.sleep(4)
 
@@ -1241,26 +1355,22 @@ async def init_all_delivery_bots():
         await promote_all_bots_in_channel(cid)
 
 # ============================================================================
-# 7. LIVE WEBSITE RE-UPLOAD SYNC & 28-CHANNEL MOVIE READJUSTER
+# 7. RE-UPLOAD (DELETE & ADD AS NEW) + RENAME ALL FILES TO OFFICIAL PUBLIC NAME
 # ============================================================================
-async def resync_files_for_website(target_query: str = None, max_items: int = 6) -> int:
-    """
-    Scans live Telegram storage channels directly!
-    Deletes 1 episode (E01) of a Series season or 1 Movie part and re-uploads it as a BRAND-NEW
-    message (plus refreshes the Series Index Card) so your website immediately reads it!
-    """
+async def resync_files_for_website(target_query: str = None, max_items: int = 8) -> int:
+    """Deletes existing movie/series/franchise part and re-uploads as a brand-new post with Official Public Name!"""
     await sync_created_channels_from_dialogs()
     ch_map = load_all_channels_from_db()
     clean_q = normalize_title_key(target_query) if target_query else None
     seen_groups = set()
     resynced = 0
 
-    scan_channels = [ch_map["series"], ch_map["anime"], ch_map["english"], ch_map["action"], ch_map["horror"], ch_map["korean"], ch_map["hindi"]]
+    scan_channels = list(dict.fromkeys([ch_map["series"], ch_map["anime"], ch_map["english"], ch_map["action"], ch_map["horror"], ch_map["korean"], ch_map["hindi"]] + list(ch_map.values())))
     for cid in scan_channels:
         if resynced >= max_items:
             break
         try:
-            iter_kwargs = {"limit": 45}
+            iter_kwargs = {"limit": 50}
             if clean_q and clean_q != "unknown":
                 iter_kwargs["search"] = target_query
             async for m in client.iter_messages(cid, **iter_kwargs):
@@ -1276,35 +1386,35 @@ async def resync_files_for_website(target_query: str = None, max_items: int = 6)
                     continue
 
                 ep_tag = extract_season_ep_tag(f"{real_fn}\n{txt}", "S01")
-                # Group by (title, season) for Series or (title, MOVIE) for Movies so we re-upload 1 part per season/movie!
                 grp_key = f"{t_key}:{ep_tag[:3] if ep_tag != 'MOVIE' else 'MOVIE'}"
-                if grp_key in seen_groups:
+                if not target_query and grp_key in seen_groups:
                     continue
                 seen_groups.add(grp_key)
 
                 yr = extract_year_from_text(real_fn)
                 meta = await fetch_meta(real_fn, yr)
+                correct_cat = detect_category(real_fn, txt, meta)
+                dest_cid = await get_or_create_genre_channel(correct_cat)
                 res_tag = extract_resolution_tag(f"{real_fn}\n{txt}", "1080P")
                 aud_tier = extract_audio_tier(f"{real_fn}\n{txt}")
                 v_key = extract_movie_variant_key(f"{real_fn}\n{txt}", res_tag, aud_tier) if ep_tag == "MOVIE" else res_tag
                 sz = m.file.size if m.file else 0
                 new_cap = build_final_caption(fn or real_fn, txt, meta, sz, ep_tag)
 
-                # Re-upload as a brand-new message and delete the old message!
-                new_sent = await publish_file_with_green_buttons(cid, m.media, new_cap, is_series=(ep_tag != "MOVIE"))
+                new_sent = await publish_file_with_green_buttons(dest_cid, m.media, new_cap, is_series=(ep_tag != "MOVIE"))
                 if new_sent:
                     await client.delete_messages(cid, [m.id])
-                    record_indexed_file(cid, new_sent.id, meta["public_title"], ep_tag, res_tag, v_key, aud_tier, real_fn)
+                    record_indexed_file(dest_cid, new_sent.id, meta["public_title"], ep_tag, res_tag, v_key, aud_tier, real_fn)
                     if ep_tag != "MOVIE":
                         await update_series_index_card(meta, ep_tag, force_resend=True)
                     resynced += 1
-                    await asyncio.sleep(2.0)
+                    await asyncio.sleep(1.8)
         except Exception:
             pass
     return resynced
 
-async def readjust_all_storage_channels() -> int:
-    """Moves existing movies into the newly created 'Vault • ...' genre channels and deletes the old copy!"""
+async def rename_and_readjust_all_channels() -> int:
+    """Renames every file across all storage channels to its Official Public Published Name & moves to right Genre Vault!"""
     await sync_created_channels_from_dialogs()
     fixed_count = 0
     all_chs = sorted(list(set(load_all_channels_from_db().values())))
@@ -1314,7 +1424,7 @@ async def readjust_all_storage_channels() -> int:
         if ch_id == index_ch:
             continue
         try:
-            async for msg in client.iter_messages(ch_id, limit=40):
+            async for msg in client.iter_messages(ch_id, limit=45):
                 if not (msg.video or msg.document) or (msg.file and (msg.file.size or 0) < MIN_VIDEO_SIZE_BYTES):
                     continue
                 fn = (msg.file.name if msg.file else "") or ""
@@ -1322,10 +1432,11 @@ async def readjust_all_storage_channels() -> int:
                 real_fn = extract_real_filename(fn, txt)
                 yr = extract_year_from_text(real_fn)
                 meta = await fetch_meta(real_fn, yr)
+                pub_title = meta.get("public_title") or ""
                 correct_cat = detect_category(real_fn, txt, meta)
                 correct_ch = await get_or_create_genre_channel(correct_cat)
 
-                if ch_id != correct_ch or "🎬" not in txt:
+                if ch_id != correct_ch or "🎬" not in txt or (pub_title and pub_title.lower() not in txt.lower()):
                     ep_tag = extract_season_ep_tag(f"{real_fn}\n{txt}", "S01")
                     res_tag = extract_resolution_tag(f"{real_fn}\n{txt}", "1080P")
                     aud_tier = extract_audio_tier(f"{real_fn}\n{txt}")
@@ -1582,7 +1693,7 @@ async def on_media_arrival(event):
         if ep_tag != "MOVIE":
             await update_series_index_card(meta, ep_tag)
 
-        await client.send_message("me", f"✅ <b>Published!</b> <code>{meta['public_title']}</code> [{ep_tag} • {variant_key}] ➔ {cat_emoji} <code>{cat.upper()}</code>", parse_mode="HTML")
+        await client.send_message("me", f"✅ <b>Published Official Name:</b> <code>{meta['public_title']}</code> [{ep_tag} • {variant_key}] ➔ {cat_emoji} <code>{cat.upper()}</code>", parse_mode="HTML")
     except FloodWaitError as fw:
         await asyncio.sleep(fw.seconds + 2)
     except Exception:
@@ -2168,7 +2279,7 @@ def enqueue_commands_bulk(raw_text: str, send_initial: bool = True, bot_entity: 
     return parsed_list
 
 # ============================================================================
-# 13. INTERACTIVE GEMINI AI CONTROLLER & SAVED MESSAGES COMMANDS
+# 13. FULL ACCOUNT CONTROL, INTERACTIVE AI CHAT & .SEARCH COMMANDS
 # ============================================================================
 async def execute_ai_controller_action(ai_res: dict, event):
     global SKIP_CURRENT_TITLE, AUTO_DISCOVERY_ENABLED
@@ -2185,43 +2296,56 @@ async def execute_ai_controller_action(ai_res: dict, event):
         if tasks:
             asyncio.create_task(process_queue())
 
+    elif act == "DELETE_MEDIA":
+        t_title = ai_res.get("target_title")
+        if t_title:
+            cnt = await delete_movie_or_series_everywhere(t_title)
+            await event.reply(f"🗑️ <b>Deleted <code>{cnt}</code> file(s)/card(s) for:</b> <code>{t_title}</code>", parse_mode="HTML")
+
+    elif act == "REUPLOAD_MEDIA":
+        t_title = ai_res.get("target_title")
+        cnt = await resync_files_for_website(t_title, max_items=8)
+        await event.reply(f"♻️ <b>Re-uploaded <code>{cnt}</code> file(s) as brand-new with Official Public Name!</b>", parse_mode="HTML")
+
+    elif act == "RENAME_ALL_PUBLIC":
+        cnt = await rename_and_readjust_all_channels()
+        await event.reply(f"✏️ <b>Renamed & Readjusted <code>{cnt}</code> file(s) to Official Public Names!</b>", parse_mode="HTML")
+
     elif act == "REBUILD_SERIES_INDEX":
         cnt = await rebuild_series_index_channel()
         await event.reply(f"✅ <b>Series Index Rebuilt:</b> Sent <code>{cnt}</code> fresh Series Master Cards!", parse_mode="HTML")
 
-    elif act == "RESYNC_WEBSITE":
-        t_title = ai_res.get("target_title")
-        cnt = await resync_files_for_website(t_title, max_items=6)
-        await event.reply(f"✅ <b>Website Re-Upload Sync Complete:</b> Re-published <code>{cnt}</code> fresh item(s)!", parse_mode="HTML")
-
-    elif act == "READJUST_CHANNELS":
-        cnt = await readjust_all_storage_channels()
-        await event.reply(f"✅ <b>Channel Readjustment Complete:</b> Moved & updated <code>{cnt}</code> movie(s)!", parse_mode="HTML")
+    elif act == "RENAME_CHANNEL":
+        ch_key = ai_res.get("target_channel_key") or ""
+        new_n = ai_res.get("new_name") or ""
+        if ch_key and new_n:
+            res_msg = await rename_telegram_channel_or_chat(ch_key, new_n)
+            await event.reply(res_msg, parse_mode="HTML")
 
     elif act == "DELETE_CHANNEL":
-        ch_key = (ai_res.get("target_channel_key") or "").lower().strip()
-        ch_map = load_all_channels_from_db()
-        if ch_key in ch_map:
-            cid = ch_map[ch_key]
+        ch_key = (ai_res.get("target_channel_key") or "").strip()
+        matches = await resolve_account_channel_target(ch_key)
+        if len(matches) == 1:
+            k_lbl, cid, _ = matches[0]
             try:
                 await client(DeleteChannelRequest(channel=cid))
                 conn = sqlite3.connect("storage_index.db")
-                conn.execute("DELETE FROM dynamic_channels WHERE cat_key=?", (ch_key,))
+                conn.execute("DELETE FROM dynamic_channels WHERE channel_id=?", (cid,))
                 conn.commit()
                 conn.close()
-                await event.reply(f"🗑️ <b>Deleted Channel:</b> <code>{ch_key.upper()}</code> (<code>{cid}</code>)", parse_mode="HTML")
+                await event.reply(f"🗑️ <b>Deleted Channel:</b> <code>{k_lbl}</code> (<code>{cid}</code>)", parse_mode="HTML")
             except Exception as e:
-                await event.reply(f"⚠️ <b>Could not delete channel:</b> <code>{e}</code>", parse_mode="HTML")
+                await event.reply(f"⚠️ Delete error: <code>{e}</code>", parse_mode="HTML")
 
     elif act == "CLEAR_CHANNEL_MESSAGES":
-        ch_key = (ai_res.get("target_channel_key") or "").lower().strip()
-        ch_map = load_all_channels_from_db()
-        if ch_key in ch_map:
-            cid = ch_map[ch_key]
+        ch_key = (ai_res.get("target_channel_key") or "").strip()
+        matches = await resolve_account_channel_target(ch_key)
+        if matches:
+            _, cid, c_name = matches[0]
             ids = [m.id async for m in client.iter_messages(cid, limit=300)]
             if ids:
                 await client.delete_messages(cid, ids)
-            await event.reply(f"🧹 <b>Cleared {len(ids)} messages in <code>{ch_key.upper()}</code>!</b>", parse_mode="HTML")
+            await event.reply(f"🧹 <b>Cleared {len(ids)} messages in <code>{c_name}</code>!</b>", parse_mode="HTML")
 
     elif act == "CREATE_CHANNEL":
         ch_key = (ai_res.get("target_channel_key") or "custom").lower().strip()
@@ -2249,7 +2373,7 @@ async def execute_ai_controller_action(ai_res: dict, event):
 async def on_outgoing_trigger(event):
     global SKIP_CURRENT_TITLE, AUTO_DISCOVERY_ENABLED, AUTO_CREATE_CHANNELS, WEB_PULSE_ENABLED, ME_USER_ID
     text = (event.message.text or "").strip()
-    if not text or text.startswith(("/", "✅", "⏳", "🏁", "⚠️", "🔗", "📋", "🛑", "🔎", "🎬", "🤖", "⚡", "♻️", "🆕", "📖", "🌐", "🧠", "🗑️", "🧹")):
+    if not text or text.startswith(("/", "✅", "⏳", "🏁", "⚠️", "🔗", "📋", "🛑", "🔎", "🎬", "🤖", "⚡", "♻️", "🆕", "📖", "🌐", "🧠", "🗑️", "🧹", "✏️", "🔑")):
         return
 
     if ME_USER_ID is None:
@@ -2260,41 +2384,143 @@ async def on_outgoing_trigger(event):
 
         if low in (".help", "help", ".admin", "admin"):
             await event.reply(
-                "📖 <b>Interactive AI & Full Admin Panel</b>\n\n"
-                "• <code>.rebuildindex</code> — Delete all messages in Series Index & resend 1 card per series\n"
-                "• <code>.resync</code> or <code>.resync Title</code> — Delete 1 part & re-upload as new for Website\n"
-                "• <code>.readjust</code> — Move & re-route movies into all 28 Genre Vaults\n"
+                "📖 <b>Full Telegram Account & AI Command Guide</b>\n\n"
+                "• <b>Random Chat:</b> Just type any message to chat with AI & control your account!\n"
+                "• <code>.search Title</code> — Direct search movie/series/range/missing\n"
+                "• <code>.auto on</code> / <code>.auto off</code> / <code>.auto 2025</code> / <code>.auto bollywood</code> — Crawler Control\n"
+                "• <code>.reupload Title</code> — Delete movie/series & re-upload as brand-new\n"
+                "• <code>.delete Title</code> — Delete movie/series from all channels\n"
+                "• <code>.renameall</code> / <code>.readjust</code> — Rename all files to Official Public Names\n"
+                "• <code>.rebuildindex</code> — Clear Series Index & resend 1 card per series\n"
+                "• <code>.delchannel key_or_name</code> — Delete a Telegram channel\n"
+                "• <code>.renamechat old_name | New Title</code> — Rename any Telegram channel/chat\n"
+                "• <code>.createchannel key_or_all</code> — Create genre channel(s)\n"
                 "• <code>.addgemini AIzaSy...</code> — Add unlimited backup Gemini API keys\n"
-                "• <code>.status</code> / <code>.channels</code> / <code>.bots</code> — View live status\n"
-                "• <code>.ai anything</code> — Chat with Gemini AI to control everything!",
+                "• <code>.status</code> / <code>.channels</code> / <code>.bots</code> / <code>.skip</code> / <code>.clear</code>",
                 parse_mode="HTML"
             )
             return
 
-        if low.startswith(".addgemini"):
-            k_str = text.split(maxsplit=1)[1] if len(text.split()) > 1 else ""
-            total_k = add_backup_gemini_key(k_str)
-            await event.reply(f"🔑 <b>Gemini Key Pool Updated!</b> Total active keys: <code>{total_k}</code>", parse_mode="HTML")
+        # 1. Explicit Direct Search Command (.search / .get / .s)
+        if low.startswith((".search ", ".get ", ".s ")):
+            added = enqueue_commands_bulk(text, send_initial=True)
+            if added:
+                summary_lines = [f"• 🎬 <code>{c['title']}</code> ({c['mode']})" for c in added[:10]]
+                await event.reply(f"⏳ <b>Queued {len(added)} Search Task(s):</b>\n" + "\n".join(summary_lines), parse_mode="HTML")
             return
 
+        # 2. Restored .auto Command (ON / OFF / Year / Category)
+        if low.startswith(".auto") or low.startswith("auto "):
+            if "off" in low:
+                AUTO_DISCOVERY_ENABLED = False
+                await event.reply("🤖 <b>24/7 Auto-Crawler Paused (OFF 🔴).</b> Send <code>.auto on</code> to resume.", parse_mode="HTML")
+                return
+            elif "on" in low:
+                AUTO_DISCOVERY_ENABLED = True
+                await event.reply("🤖 <b>24/7 Auto-Crawler Resumed (ON 🟢)!</b>", parse_mode="HTML")
+                return
+            yr_m = re.search(r"\b(19[5-9]\d|20[0-3]\d)\b", low)
+            c_yr, _, c_kind = get_crawler_progress()
+            for mode_name in CRAWLER_MODES:
+                if mode_name in low:
+                    c_kind = mode_name
+                    break
+            if yr_m:
+                c_yr = int(yr_m.group(1))
+            save_crawler_progress(c_yr, 1, c_kind)
+            AUTO_DISCOVERY_ENABLED = True
+            await event.reply(f"🤖 <b>Auto-Crawler set to:</b> Year <code>{c_yr}</code> • Category <code>{c_kind.upper()}</code>!", parse_mode="HTML")
+            return
+
+        # 3. Delete Movie / Series Command (.delete / .rm)
+        if low.startswith((".delete ", ".rm ")):
+            q_del = text.split(maxsplit=1)[1].strip()
+            await event.reply(f"🗑️ <b>Deleting all files & index cards for:</b> <code>{q_del}</code>...", parse_mode="HTML")
+            cnt = await delete_movie_or_series_everywhere(q_del)
+            await event.reply(f"✅ <b>Deleted <code>{cnt}</code> post(s) for:</b> <code>{q_del}</code>", parse_mode="HTML")
+            return
+
+        # 4. Re-Upload Movie / Series / Franchise as Brand-New (.reupload / .resync)
+        if low.startswith((".reupload", ".resync")):
+            parts = text.split(maxsplit=1)
+            q_str = parts[1].strip() if len(parts) > 1 else None
+            await event.reply(f"♻️ <b>Deleting old copy & re-uploading as brand-new with Official Public Name ({q_str or 'Batch'})...</b>", parse_mode="HTML")
+            cnt = await resync_files_for_website(q_str, max_items=8)
+            await event.reply(f"✅ <b>Re-Upload Complete:</b> Published <code>{cnt}</code> fresh item(s)!", parse_mode="HTML")
+            return
+
+        # 5. Rename All Files to Official Public Names & Readjust Channels (.renameall / .readjust)
+        if low in (".renameall", "renameall", ".readjust", "readjust"):
+            await event.reply("✏️ <b>Renaming all channel files to Official Public Names & moving to Genre Vaults...</b>", parse_mode="HTML")
+            fixed = await rename_and_readjust_all_channels()
+            await event.reply(f"✅ <b>Rename & Readjust Complete:</b> Updated <code>{fixed}</code> file(s)!", parse_mode="HTML")
+            return
+
+        # 6. Delete Telegram Channel (.delchannel)
+        if low.startswith(".delchannel"):
+            parts = text.split(maxsplit=1)
+            target_ch = parts[1].strip() if len(parts) > 1 else ""
+            matches = await resolve_account_channel_target(target_ch)
+            if not matches:
+                await event.reply(f"⚠️ <b>No channel found matching:</b> <code>{target_ch}</code>", parse_mode="HTML")
+            elif len(matches) > 1:
+                opts = "\n".join(f"• <code>.delchannel {cid}</code> ({name})" for _, cid, name in matches[:8])
+                await event.reply(f"⚠️ <b>Multiple channels match '{target_ch}'. Which one should I delete?</b>\n{opts}", parse_mode="HTML")
+            else:
+                _, cid, c_name = matches[0]
+                try:
+                    await client(DeleteChannelRequest(channel=cid))
+                    conn = sqlite3.connect("storage_index.db")
+                    conn.execute("DELETE FROM dynamic_channels WHERE channel_id=?", (cid,))
+                    conn.commit()
+                    conn.close()
+                    await event.reply(f"🗑️ <b>Deleted Channel:</b> <code>{c_name}</code> (<code>{cid}</code>)", parse_mode="HTML")
+                except Exception as e:
+                    await event.reply(f"⚠️ Delete channel error: <code>{e}</code>", parse_mode="HTML")
+            return
+
+        # 7. Rename Telegram Channel / Chat (.renamechat old | new)
+        if low.startswith(".renamechat"):
+            body = text.split(maxsplit=1)[1] if len(text.split()) > 1 else ""
+            if "|" in body:
+                old_t, new_t = [x.strip() for x in body.split("|", 1)]
+                res_msg = await rename_telegram_channel_or_chat(old_t, new_t)
+                await event.reply(res_msg, parse_mode="HTML")
+            else:
+                await event.reply("⚠️ <b>Format:</b> <code>.renamechat scifi | Vault • Sci-Fi Movies</code>", parse_mode="HTML")
+            return
+
+        # 8. Rebuild Series Index Channel (.rebuildindex)
         if low in (".rebuildindex", "rebuildindex", ".fixindex", "fixindex"):
             await event.reply("🧹 <b>Clearing Series Index Channel & sending 1 fresh Master Card per Series...</b>", parse_mode="HTML")
             cnt = await rebuild_series_index_channel()
             await event.reply(f"✅ <b>Series Index Rebuilt:</b> Sent <code>{cnt}</code> clean Series Master Card(s)!", parse_mode="HTML")
             return
 
-        if low.startswith(".resync") or low.startswith("resync"):
-            parts = text.split(maxsplit=1)
-            q_str = parts[1].strip() if len(parts) > 1 else None
-            await event.reply(f"🌐 <b>Deleting 1 part & re-uploading as brand-new post for Website ({q_str or 'Batch'})...</b>", parse_mode="HTML")
-            cnt = await resync_files_for_website(q_str, max_items=6)
-            await event.reply(f"✅ <b>Website Re-Upload Sync Complete:</b> Re-published <code>{cnt}</code> fresh item(s)!", parse_mode="HTML")
+        # 9. Add Unlimited Backup Gemini Keys (.addgemini)
+        if low.startswith(".addgemini"):
+            k_str = text.split(maxsplit=1)[1] if len(text.split()) > 1 else ""
+            total_k = add_backup_gemini_key(k_str)
+            await event.reply(f"🔑 <b>Gemini Key Pool Updated!</b> Total active keys: <code>{total_k}</code>", parse_mode="HTML")
             return
 
-        if low in (".readjust", "readjust"):
-            await event.reply("♻️ <b>Moving & readjusting movies across all 28 Genre Vault channels...</b>", parse_mode="HTML")
-            fixed = await readjust_all_storage_channels()
-            await event.reply(f"✅ <b>Readjustment Complete:</b> Moved & updated <code>{fixed}</code> files!", parse_mode="HTML")
+        # 10. Create Genre Channel(s) (.createchannel)
+        if low.startswith(".createchannel"):
+            parts = low.split(maxsplit=1)
+            cat_k = parts[1].strip() if len(parts) > 1 else "series_index"
+            if cat_k == "all":
+                await event.reply("🆕 <b>Creating all detailed genre channels...</b>", parse_mode="HTML")
+                created = []
+                for gk in DETAILED_GENRE_TITLES.keys():
+                    if count_unique_storage_channels() >= MAX_STORAGE_CHANNELS:
+                        break
+                    cid = await get_or_create_genre_channel(gk)
+                    created.append(f"{gk.upper()}: {cid}")
+                    await asyncio.sleep(3.0)
+                await event.reply("✅ <b>Channels Ready:</b>\n" + "\n".join(created), parse_mode="HTML")
+                return
+            cid = await get_or_create_genre_channel(cat_k)
+            await event.reply(f"🆕 <b>Channel Ready for <code>{cat_k.upper()}</code>:</b> <code>{cid}</code>", parse_mode="HTML")
             return
 
         if low in (".bots", "bots"):
@@ -2336,32 +2562,24 @@ async def on_outgoing_trigger(event):
             await event.reply(f"🛑 <b>Cleared {count} items from queue.</b>", parse_mode="HTML")
             return
 
-        # Interactive Conversational AI Controller (Triggers on .ai or natural language commands!)
-        is_ai_chat = low.startswith(".ai ") or any(w in low for w in [
-            "top ", "best ", "delete ", "channel", "rebuild", "resync", "reupload",
-            "re-upload", "readjust", "pause", "stop", "which ", "why ", "how ", "can you", "please"
-        ])
-        if is_ai_chat:
-            clean_prompt = re.sub(r"^\.ai\s+", "", text, flags=re.I).strip()
-            AI_CHAT_HISTORY.append(f"User: {clean_prompt}")
-            ai_res = await gemini_interactive_agent(clean_prompt)
-            if ai_res:
-                await execute_ai_controller_action(ai_res, event)
-                return
-            # Fallback to TMDB smart list if Gemini keys weren't set
-            fallback_tasks = await tmdb_smart_list_fallback(clean_prompt)
-            if fallback_tasks:
-                for t_obj in fallback_tasks:
-                    TITLE_QUEUE.append((t_obj, True))
-                asyncio.create_task(process_queue())
-                names = "\n".join(f"• 🎬 <code>{t['raw']}</code>" for t in fallback_tasks[:12])
-                await event.reply(f"🤖 <b>Queued {len(fallback_tasks)} Title(s):</b>\n{names}", parse_mode="HTML")
-                return
+        # 11. DEFAULT FOR RANDOM MESSAGES: Interactive Conversational Gemini AI Controller!
+        clean_prompt = re.sub(r"^\.ai\s+", "", text, flags=re.I).strip()
+        AI_CHAT_HISTORY.append(f"User: {clean_prompt}")
+        ai_res = await gemini_interactive_agent(clean_prompt)
+        if ai_res:
+            await execute_ai_controller_action(ai_res, event)
+            return
 
-        added = enqueue_commands_bulk(text, send_initial=True)
-        if added:
-            summary_lines = [f"• 🎬 <code>{c['title']}</code> ({c['mode']})" for c in added[:8]]
-            await event.reply(f"⏳ <b>Queued {len(added)} Task(s):</b>\n" + "\n".join(summary_lines), parse_mode="HTML")
+        fallback_tasks = await tmdb_smart_list_fallback(clean_prompt)
+        if fallback_tasks:
+            for t_obj in fallback_tasks:
+                TITLE_QUEUE.append((t_obj, True))
+            asyncio.create_task(process_queue())
+            names = "\n".join(f"• 🎬 <code>{t['raw']}</code>" for t in fallback_tasks[:12])
+            await event.reply(f"🤖 <b>Queued {len(fallback_tasks)} Title(s):</b>\n{names}", parse_mode="HTML")
+            return
+
+        await event.reply("🤖 <i>Use <code>.search Title</code> to search directly, or add <code>GEMINI_API_KEY</code> in Render for full AI chat control!</i>", parse_mode="HTML")
         return
 
     chat = await event.get_chat()
@@ -2423,7 +2641,7 @@ async def main():
     asyncio.create_task(web_pulse_background_worker())
     asyncio.create_task(auto_discovery_crawler_worker())
 
-    print(f"🚀 24/7 Interactive AI Pipeline LIVE! Gemini Keys: {len(GEMINI_KEYS)} | Delivery Bots: {len(BOT_POOL)}")
+    print(f"🚀 24/7 Full AI Control Pipeline LIVE! Gemini Keys: {len(GEMINI_KEYS)} | Delivery Bots: {len(BOT_POOL)}")
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
