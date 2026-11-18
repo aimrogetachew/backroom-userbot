@@ -978,8 +978,7 @@ async def gemini_interactive_agent(user_msg: str) -> dict:
     history_str = "\n".join(AI_CHAT_HISTORY)
 
     prompt = f"""
-    You are THE BACKROOM AI COMMANDER — a warm, intelligent, ChatGPT-like personal AI operating system inside the owner's Telegram account.
-    Talk naturally, helpfully, and conversationally with the owner.
+    You are THE BACKROOM AI COMMANDER — a persistent personal AI operating system inside the owner's Telegram account.
     Current State:
     - Active Download: {ACTIVE_CLEAN_TITLE or 'Idle'} ({ACTIVE_RES_TAG or '-'}) | Queue: {len(TITLE_QUEUE)}
     - Auto-Crawler: {'ON' if AUTO_DISCOVERY_ENABLED else 'OFF'} (Year: {c_yr}, Category: {c_kind})
@@ -997,16 +996,18 @@ async def gemini_interactive_agent(user_msg: str) -> dict:
 
     OWNER MESSAGE: "{user_msg}"
 
-    Instructions:
-    1. If the owner is chatting ("How are u", "Tell me about u", general questions, code/project discussion), reply naturally like ChatGPT and set action="CHAT_ONLY".
-    2. If the owner says "stop anything on progress" or "stop everything", set action="STOP_ALL" and crawler_on=false.
-    3. If the owner asks to delete everything from one storage channel and re-upload it again by itself, set action="WIPE_AND_REUPLOAD_CHANNEL" and target_channel_key="<cat_key_or_id>".
-    4. If the owner gives a permanent rule ("From now on...", "Always...", "Never..."), set action="MANAGE_RULE", rule_op="ADD", and rule_text="<clean rule>".
-    5. Other actions: "SEARCH_ACCOUNT", "SEARCH_CONTACTS", "INSPECT_WEBSITE", "SELF_EVOLVE", "SCHEDULE_JOB", "QUEUE_TITLES", "DELETE_MEDIA", "REUPLOAD_MEDIA", "RENAME_ALL_PUBLIC", "REBUILD_SERIES_INDEX", "RENAME_CHANNEL", "DELETE_CHANNEL", "CLEAR_CHANNEL_MESSAGES", "CREATE_CHANNEL", "CRAWLER_CONTROL", "SKIP", "CLEAR_QUEUE".
+    CRITICAL EXECUTION RULES (DO NOT ROLEPLAY WITHOUT AN ACTION!):
+    1. NEVER say "I am checking right now" or "Let me search for X" with action="CHAT_ONLY"! You are a single-turn tool executor: if an action is needed, you MUST set the matching "action" field NOW!
+    2. If the owner sends a movie or series title (e.g. "Prison break", "Vikings", "Solo Leveling") or asks to find/download/pull up a title, you MUST set action="QUEUE_TITLES" and populate "tasks": [{{"raw": "Prison Break", "title": "Prison Break", "year": null, "mode": "normal", "season": null, "episodes": null}}]!
+    3. If the owner asks to check/scan/verify what movies or files are inside their storage channel(s) (or says "Have u checked it?"), you MUST set action="INSPECT_STORAGE" and target_channel_key="<cat_key or null for all>"!
+    4. If the owner says "stop anything on progress" or "stop everything", set action="STOP_ALL" and crawler_on=false.
+    5. If the owner asks to delete everything from one storage channel and re-upload it again by itself, set action="WIPE_AND_REUPLOAD_CHANNEL" and target_channel_key="<cat_key_or_id>".
+    6. If the owner gives a permanent rule ("From now on...", "Always...", "Never..."), set action="MANAGE_RULE", rule_op="ADD", and rule_text="<clean rule>".
+    7. Other actions: "SEARCH_ACCOUNT", "SEARCH_CONTACTS", "INSPECT_WEBSITE", "SELF_EVOLVE", "SCHEDULE_JOB", "DELETE_MEDIA", "REUPLOAD_MEDIA", "RENAME_ALL_PUBLIC", "REBUILD_SERIES_INDEX", "RENAME_CHANNEL", "DELETE_CHANNEL", "CLEAR_CHANNEL_MESSAGES", "CREATE_CHANNEL", "CRAWLER_CONTROL", "SKIP", "CLEAR_QUEUE".
 
     Return ONLY valid JSON:
     {{
-      "reply": "Warm, intelligent, natural HTML-formatted response",
+      "reply": "Warm, direct HTML-formatted response",
       "action": "CHAT_ONLY",
       "risk_level": "LOW",
       "rule_op": null, "rule_id": null, "rule_text": null, "memory_to_save": null,
@@ -1018,7 +1019,18 @@ async def gemini_interactive_agent(user_msg: str) -> dict:
     """
     res = await ask_gemini_json(prompt)
     if isinstance(res, dict) and res.get("action"):
+        # Safety Net: If Gemini's reply says it is searching/pulling up a title but forgot to set action="QUEUE_TITLES"
+        act = (res.get("action") or "CHAT_ONLY").upper()
+        rep_low = (res.get("reply") or "").lower()
+        if act == "CHAT_ONLY":
+            if any(p in rep_low for p in ["looking into your storage", "checking it right now", "pull up the list from your storage"]):
+                res["action"] = "INSPECT_STORAGE"
+            elif any(p in rep_low for p in ["let me search for", "pull up the series index", "fetch its details"]) and len(user_msg.split()) <= 6:
+                cmd = parse_smart_user_command(user_msg)
+                res["action"] = "QUEUE_TITLES"
+                res["tasks"] = [cmd]
         return res
+
     top_tasks = await tmdb_smart_list_fallback(user_msg)
     if top_tasks:
         return {"action": "QUEUE_TITLES", "risk_level": "LOW", "reply": f"Queued <b>{len(top_tasks)}</b> titles from TMDB Discover!", "tasks": top_tasks}
@@ -1402,21 +1414,20 @@ async def update_series_index_card(meta: dict, ep_tag: str, force_resend: bool =
     seasons_set.add(season_code)
     sorted_seasons = sorted(list(seasons_set))
 
+    # Obeys Permanent Rule #1: Inline buttons show ONLY the Season name (no resolution tags!)
     season_rows = []
     active_bots = [b for b in BOT_POOL[:2] if b.get("username")]
     for s_code in sorted_seasons:
         s_num = int(s_code[1:]) if s_code[1:].isdigit() else 1
-        quals = get_available_season_qualities(slug, s_code)
-        q_str = "/".join(quals[:3]) if quals else "HD"
         if len(active_bots) >= 2:
             b1_u, b2_u = active_bots[0]["username"], active_bots[1]["username"]
             season_rows.append([
-                {"text": f"📺 Season {s_num:02d} ({q_str}) • Bot 1 ↗", "url": f"https://t.me/{b1_u}?start=season_{slug}_{s_code}", "style": "primary"},
+                {"text": f"📺 Season {s_num:02d} • Bot 1 ↗", "url": f"https://t.me/{b1_u}?start=season_{slug}_{s_code}", "style": "primary"},
                 {"text": f"📺 Season {s_num:02d} • Bot 2 ↗", "url": f"https://t.me/{b2_u}?start=season_{slug}_{s_code}", "style": "primary"}
             ])
         elif active_bots:
             b1_u = active_bots[0]["username"]
-            season_rows.append([{"text": f"📺 Season {s_num:02d} ({q_str}) ↗", "url": f"https://t.me/{b1_u}?start=season_{slug}_{s_code}", "style": "primary"}])
+            season_rows.append([{"text": f"📺 Season {s_num:02d} ↗", "url": f"https://t.me/{b1_u}?start=season_{slug}_{s_code}", "style": "primary"}])
 
     season_rows.append(GREEN_BRAND_ROW)
     markup = {"inline_keyboard": season_rows}
@@ -1425,7 +1436,7 @@ async def update_series_index_card(meta: dict, ep_tag: str, force_resend: bool =
         f"📺 <b>{pub_title}{yr_str}</b>\n"
         f"🎭 <b>Genre:</b> {meta.get('genres') or 'Series'} • ⭐ <b>{meta.get('rating') or 'HD'}</b>\n"
         f"📦 <b>Available Seasons:</b> <code>{', '.join(sorted_seasons)}</code>\n\n"
-        f"👇 <i>Tap a Season button below to choose your Quality (360p / 480p / 720p / 1080p) and get all episodes!</i>"
+        f"👇 <i>Tap a Season button below to choose your Quality and receive all episodes!</i>"
     )
 
     token = BOT_POOL[0]["token"]
@@ -2637,6 +2648,13 @@ async def process_queue():
                 target_eps = set(cmd["episodes"]) if cmd["episodes"] else None
                 primary_bot = cmd.get("bot_entity") or SOURCE_BOT
 
+                if cmd.get("manual"):
+                    await client.send_message(
+                        "me",
+                        f"🔎 <b>Searching @{primary_bot} for:</b> <code>{popular_title}</code>...",
+                        parse_mode="HTML"
+                    )
+
                 found_primary = await run_extraction_on_bot(
                     primary_bot, popular_title, query, start_season,
                     target_year=target_year, target_eps=target_eps, send_initial=send_initial
@@ -2645,11 +2663,23 @@ async def process_queue():
 
                 if BACKUP_BOT and primary_bot != BACKUP_BOT and not SKIP_CURRENT_TITLE:
                     if not found_primary or (not meta_info.get("is_series") and len(stored_res) < 3):
+                        if cmd.get("manual"):
+                            await client.send_message(
+                                "me",
+                                f"🔄 <b>Checking Backup Bot @{BACKUP_BOT} for:</b> <code>{popular_title}</code>...",
+                                parse_mode="HTML"
+                            )
                         await asyncio.sleep(2.0)
-                        await run_extraction_on_bot(
+                        found_backup = await run_extraction_on_bot(
                             BACKUP_BOT, popular_title, query, start_season,
                             target_year=target_year, target_eps=target_eps, send_initial=True
                         )
+                        if not found_primary and not found_backup and cmd.get("manual"):
+                            await client.send_message(
+                                "me",
+                                f"⚠️ <b>Not Found:</b> <code>{popular_title}</code> returned no matching files on @{primary_bot} or @{BACKUP_BOT}.",
+                                parse_mode="HTML"
+                            )
 
                 await client.send_message(
                     "me",
@@ -2667,18 +2697,23 @@ async def process_queue():
         ACTIVE_RES_TAG = ""
 
 def enqueue_commands_bulk(raw_text: str, send_initial: bool = True, bot_entity: str = None) -> list:
+    global SKIP_CURRENT_TITLE
     raw_items = split_bulk_commands(raw_text)
     parsed_list = []
-    for item in raw_items:
+    for item in reversed(raw_items):
         cmd = parse_smart_user_command(item)
+        cmd["manual"] = True
         if bot_entity:
             cmd["bot_entity"] = bot_entity
         if cmd["title"] and len(cmd["title"]) >= 2 and normalize_title_key(cmd["title"]) != "unknown":
-            TITLE_QUEUE.append((cmd, send_initial))
+            TITLE_QUEUE.appendleft((cmd, send_initial))
             parsed_list.append(cmd)
     if parsed_list:
+        if CURRENT_PIPELINE_ACTIVE:
+            SKIP_CURRENT_TITLE = True
+            FILE_COMPLETED_EVENT.set()
         asyncio.create_task(process_queue())
-    return parsed_list
+    return list(reversed(parsed_list))
 
 # ============================================================================
 # 13. THE BACKROOM AI COMMANDER ORCHESTRATOR & SAVED MESSAGES
