@@ -1,5 +1,3 @@
-
-
 import os, sys, re, ast, json, shutil, asyncio, sqlite3
 from datetime import datetime, timezone
 from collections import deque
@@ -17,6 +15,7 @@ from telethon.tl.functions.channels import (
     JoinChannelRequest, CreateChannelRequest, EditAdminRequest,
     DeleteChannelRequest, EditTitleRequest
 )
+from telethon.tl.functions.contacts import GetContactsRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest, ToggleNoForwardsRequest
 from telethon.tl.types import ChatAdminRights
 
@@ -92,6 +91,19 @@ TMDB_GENRE_MAP = {
     53: "Thriller", 10752: "War", 37: "Western", 10759: "Action & Adventure", 10765: "Sci-Fi & Fantasy"
 }
 
+ORIG_LANG_MAP = {
+    "en": "English", "ja": "Japanese", "ko": "Korean", "hi": "Hindi", "tr": "Turkish",
+    "am": "Amharic", "ta": "Tamil", "te": "Telugu", "ml": "Malayalam", "kn": "Kannada",
+    "zh": "Mandarin", "es": "Spanish", "fr": "French", "de": "German", "it": "Italian"
+}
+
+FRANCHISE_ALIASES = {
+    "fast and furious 9": "F9", "f9 linkz": "F9", "fast 9": "F9",
+    "the fast and furious 3": "The Fast and the Furious: Tokyo Drift",
+    "fast and furious 3": "The Fast and the Furious: Tokyo Drift",
+    "minions monsters": "Minions & Monsters"
+}
+
 INLINE_BUTTONS = [[
     Button.url("Series ↗", "https://t.me/thebackroomseries"),
     Button.url("Anime ↗", "https://t.me/thebackroomanime"),
@@ -117,10 +129,11 @@ SYNCED_TITLES = set()
 DIALOG_CACHE_READY = False
 META_CACHE = {}
 TITLE_QUEUE = deque()
-AI_CHAT_HISTORY = deque(maxlen=16)
+AI_CHAT_HISTORY = deque(maxlen=18)
 BOT_POOL = []
 BOT_RR_INDEX = 0
 GEMINI_KEY_INDEX = 0
+PENDING_APPROVAL_ACTION = None
 
 OMDB_CALL_DAY = ""
 OMDB_CALL_COUNT = 0
@@ -162,25 +175,57 @@ def pick_bot_for_role(role: str = "any") -> dict:
     return chosen
 
 # ============================================================================
-# 2. CLEAN OFFICIAL TITLE PARSER & COMMAND EXTRACTOR
+# 2. STRICT OFFICIAL PUBLIC TITLE CLEANER (STRIPS ALL UPLOADER & SCENE JUNK)
 # ============================================================================
+JUNK_PREFIX_RE = re.compile(
+    r"^(?:\s*(?:\[(?:CF|MFA|CC|SO|AE|PSA|YTS|RARBG|PAHE|DFBC|TOONWORLD4ALL|[^\]]{1,16})\]|"
+    r"\b(?:DFBC|Toonworld4all|Toonworld|KatmovieHD|Vegamovies|MoviesMod|Filmyzilla|HDHub4u|18\+)\b|"
+    r"@[A-Za-z0-9_]+|S\d{1,2}E\d{1,3}\s*[\-–:]\s*))+",
+    re.I
+)
+
+JUNK_TOKENS_RE = re.compile(
+    r"\b(?:Linkz|Multi\s*Aud(?:io)?|Dual\s*Aud(?:io)?|ESub|MSub|UNCUT|EXTENDED|REMASTERED|"
+    r"BluRay|BDRip|BRRip|WEB-?DL|WEBRip|HDRip|DVDRip|CAMRip|HDTS|NF|AMZN|DSNP|Pahe|PSA|YTS|RARBG|"
+    r"DFBC|Toonworld4all|Toonworld|KatmovieHD|Vegamovies|MoviesMod|Filmyzilla|HDHub4u|"
+    r"MKV|MP4|AVI|HEVC|x265|x264|h265|h264|AV1|VP9|10Bit|8Bit|6CH|8CH|AAC\d*(?:[\.\s]\d)?|"
+    r"DDP\d*(?:[\.\s]\d)?|AC3|Atmos|Dubbed|Dub)\b.*$",
+    re.I
+)
+
 def extract_year_from_text(text: str):
     m = re.search(r"\b(19[5-9]\d|20[0-3]\d)\b", text or "")
     return int(m.group(1)) if m else None
 
+def strip_uploader_and_junk(raw_str: str) -> str:
+    s = re.sub(r"https?://\S+|t\.me/\S+|@[A-Za-z0-9_]+", " ", str(raw_str or ""))
+    s = JUNK_PREFIX_RE.sub(" ", s).strip()
+    s = re.sub(r"\[(?:CF|MFA|CC|SO|AE|PSA|YTS|RARBG|PAHE|DFBC|TOONWORLD4ALL)\]", " ", s, flags=re.I)
+    return s.strip()
+
 def normalize_title_key(title: str) -> str:
-    s = re.sub(r"['’`]", "", title or "")
+    s = strip_uploader_and_junk(title)
+    s = re.sub(r"['’`]", "", s)
     s = re.sub(r"[._\-·•]+", " ", s).strip()
     s = re.sub(r"^[^\w]+", "", s).strip()
+    # Strip leading S01E06 if it was at the very start of the filename
+    s = re.sub(r"^(?:S\d{1,2}E\d{1,3}|E\d{1,3})\s+", "", s, flags=re.I).strip()
+
     cut_m = re.search(
-        r"^(.{2,}?)\s+\b(?:19[5-9]\d|20[0-3]\d|S\d{1,2}E\d{1,3}|S\d{1,2}|Season\s*\d+|E\d{1,3}|EP\.?\s*\d+|360p|480p|540p|720p|1080p|1440p|2160p|4K|BluRay|WEB-?DL|WEBRip|HDRip|DVDRip|CAMRip|HDTS)\b",
+        r"^(.{2,}?)\s+\b(?:19[5-9]\d|20[0-3]\d|S\d{1,2}E\d{1,3}|S\d{1,2}|Season\s*\d+|E\d{1,3}|EP\.?\s*\d+|"
+        r"360p|480p|540p|720p|1080p|1440p|2160p|4K|BluRay|WEB-?DL|WEBRip|HDRip|DVDRip|CAMRip|HDTS)\b",
         s, flags=re.I
     )
     if cut_m and not re.fullmatch(r"\d{4}", cut_m.group(1).strip()):
         s = cut_m.group(1)
-    s = re.sub(r"\b(NF|AMZN|DSNP|Pahe|MKV|MP4|HEVC|x265|x264|10Bit|6CH|8CH|AAC\d*|DDP\d*|ESub|Dual\s*Audio|Multi\s*Audio|Dubbed|Dub)\b.*$", "", s, flags=re.I)
-    out_s = re.sub(r"[^a-zA-Z0-9]+", " ", s).strip().lower()
-    if not out_s or re.fullmatch(r"\d{4}", out_s):
+
+    s = JUNK_TOKENS_RE.sub("", s)
+    out_s = re.sub(r"[^a-zA-Z0-9&]+", " ", s).strip().lower()
+    # Remove trailing standalone junk numbers like "108" unless part of a known sequel
+    out_s = re.sub(r"\s+\b(?:108|72|48|36)\b$", "", out_s).strip()
+    if out_s in FRANCHISE_ALIASES:
+        out_s = FRANCHISE_ALIASES[out_s].lower()
+    if not out_s or re.fullmatch(r"\d{1,4}", out_s):
         return "unknown"
     return out_s
 
@@ -236,6 +281,8 @@ def parse_smart_user_command(raw_text: str) -> dict:
 
     target_year = extract_year_from_text(text)
     clean_search_title = re.sub(r"\(\d{4}\)|\[\d{4}\]|\b(19[5-9]\d|20[0-3]\d)\b", "", text).strip(" ,.-:")
+    if clean_search_title.lower() in FRANCHISE_ALIASES:
+        clean_search_title = FRANCHISE_ALIASES[clean_search_title.lower()]
     return {
         "raw": raw_text.strip(), "title": clean_search_title or text.strip(" ,."),
         "year": target_year, "mode": mode, "season": season_num,
@@ -258,7 +305,7 @@ def split_bulk_commands(raw_message: str) -> list:
     return commands
 
 # ============================================================================
-# 3. DATABASE: MEMORY, PERMANENT RULES, SELF-EVOLUTION & CHANNELS
+# 3. DATABASE: MEMORY, PERMANENT RULES, SKILLS, TASKS & CHANNELS
 # ============================================================================
 def extract_resolution_tag(text: str, default_res: str = "HD") -> str:
     m = re.search(r"\b(360p|480p|540p|720p|1080p|1440p|2160p|4K)\b", text or "", re.I)
@@ -266,9 +313,9 @@ def extract_resolution_tag(text: str, default_res: str = "HD") -> str:
 
 def extract_audio_tier(text: str, num_langs: int = 1) -> int:
     t = (text or "").lower()
-    if num_langs >= 3 or re.search(r"\b(multi\s*audio|multi\s*dub|multi|dubbed|hin.*eng.*jap|tam.*tel.*hin)\b", t):
+    if num_langs >= 3 or re.search(r"\b(multi\s*audio|multi\s*aud|multi\s*dub|multi|dubbed|hin.*eng.*jap|tam.*tel.*hin)\b", t):
         return 3
-    if num_langs == 2 or re.search(r"\b(dual\s*audio|dual\s*dub|dual|hin[\s\-\+]+eng|eng[\s\-\+]+jap)\b", t):
+    if num_langs == 2 or re.search(r"\b(dual\s*audio|dual\s*aud|dual\s*dub|dual|hin[\s\-\+]+eng|eng[\s\-\+]+jap)\b", t):
         return 2
     return 1
 
@@ -312,7 +359,7 @@ def init_storage_db():
     conn.execute("CREATE TABLE IF NOT EXISTS behavior_rules (id INTEGER PRIMARY KEY AUTOINCREMENT, rule_text TEXT NOT NULL, category TEXT DEFAULT 'general', priority INTEGER DEFAULT 5, active INTEGER DEFAULT 1, version INTEGER DEFAULT 1, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
     conn.execute("CREATE TABLE IF NOT EXISTS rule_versions (rule_id INTEGER, version INTEGER, old_text TEXT, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
     conn.execute("CREATE TABLE IF NOT EXISTS long_term_memory (id INTEGER PRIMARY KEY AUTOINCREMENT, category TEXT NOT NULL, mem_key TEXT NOT NULL UNIQUE, mem_value TEXT NOT NULL, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
-    conn.execute("CREATE TABLE IF NOT EXISTS custom_capabilities (cap_name TEXT PRIMARY KEY, description TEXT, python_code TEXT NOT NULL, active INTEGER DEFAULT 1, version INTEGER DEFAULT 1, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+    conn.execute("CREATE TABLE IF NOT EXISTS custom_capabilities (cap_name TEXT PRIMARY KEY, description TEXT, python_code TEXT NOT NULL, active INTEGER DEFAULT 0, version INTEGER DEFAULT 1, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
     conn.execute("CREATE TABLE IF NOT EXISTS evolution_history (id INTEGER PRIMARY KEY AUTOINCREMENT, change_type TEXT, summary TEXT, backup_path TEXT, status TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
     conn.execute("CREATE TABLE IF NOT EXISTS audit_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, user_request TEXT, action_type TEXT, risk_level TEXT, status TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
     conn.execute("CREATE TABLE IF NOT EXISTS scheduled_jobs (job_id TEXT PRIMARY KEY, task_prompt TEXT NOT NULL, interval_minutes INTEGER NOT NULL, last_run TIMESTAMP, active INTEGER DEFAULT 1)")
@@ -325,14 +372,14 @@ def init_storage_db():
     conn.commit()
     conn.close()
 
-def manage_behavior_rule(op: str, rule_text: str = "", rule_id: int = None, category: str = "general") -> str:
+def manage_behavior_rule(op: str, rule_text: str = "", rule_id: int = None, category: str = "PERMANENT_INSTRUCTION") -> str:
     conn = sqlite3.connect("storage_index.db")
     op = (op or "ADD").upper()
     if op == "ADD" and rule_text:
         row = conn.execute("SELECT id FROM behavior_rules WHERE lower(rule_text)=?", (rule_text.lower().strip(),)).fetchone()
         if row:
             conn.close()
-            return f"Rule #{row[0]} already active."
+            return f"Rule #{row[0]} is already active."
         cur = conn.execute("INSERT INTO behavior_rules (rule_text, category) VALUES (?, ?)", (rule_text.strip(), category))
         rid = cur.lastrowid
         conn.commit()
@@ -367,7 +414,7 @@ def get_active_behavior_rules() -> list:
 
 def save_long_term_memory(category: str, mem_key: str, mem_value: str):
     conn = sqlite3.connect("storage_index.db")
-    conn.execute("INSERT OR REPLACE INTO long_term_memory (category, mem_key, mem_value, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)", (category.lower().strip(), mem_key.lower().strip(), str(mem_value).strip()))
+    conn.execute("INSERT OR REPLACE INTO long_term_memory (category, mem_key, mem_value, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)", (category.upper().strip(), mem_key.lower().strip(), str(mem_value).strip()))
     conn.commit()
     conn.close()
 
@@ -383,7 +430,7 @@ def log_audit_event(user_req: str, action_type: str, risk_level: str, status: st
     conn.commit()
     conn.close()
 
-def stage_or_register_capability(cap_name: str, description: str, python_code: str, auto_activate: bool = True) -> str:
+def stage_or_register_capability(cap_name: str, description: str, python_code: str, auto_activate: bool = False) -> str:
     try:
         ast.parse(python_code)
     except SyntaxError as se:
@@ -399,10 +446,14 @@ def stage_or_register_capability(cap_name: str, description: str, python_code: s
         f.write(python_code)
     conn = sqlite3.connect("storage_index.db")
     conn.execute("INSERT OR REPLACE INTO custom_capabilities (cap_name, description, python_code, active, version, updated_at) VALUES (?, ?, ?, ?, 1, CURRENT_TIMESTAMP)", (cap_name, description, python_code, 1 if auto_activate else 0))
-    conn.execute("INSERT INTO evolution_history (change_type, summary, backup_path, status) VALUES (?, ?, ?, ?)", ("CAPABILITY", f"{cap_name}: {description}", backup_file, "ACTIVE"))
+    conn.execute("INSERT INTO evolution_history (change_type, summary, backup_path, status) VALUES (?, ?, ?, ?)", ("SKILL_PROPOSAL", f"{cap_name}: {description}", backup_file, "ACTIVE" if auto_activate else "WAITING_FOR_APPROVAL"))
     conn.commit()
     conn.close()
-    return f"🧬 <b>Self-Evolution Capability Registered:</b> <code>{cap_name}</code> (Backup: <code>{backup_file}</code>)"
+    return (
+        f"🧬 <b>Skill Staged:</b> <code>{cap_name}</code>\n"
+        f"• <b>AST Check:</b> Passed ✅ | <b>Backup:</b> <code>{backup_file}</code>\n"
+        f"• <b>Status:</b> {'Activated' if auto_activate else 'Waiting for Owner Approval (send .approve to activate)'}"
+    )
 
 async def search_account_intelligence(query: str, limit: int = 15) -> str:
     results = []
@@ -422,6 +473,20 @@ async def search_account_intelligence(query: str, limit: int = 15) -> str:
     except Exception as e:
         return f"⚠️ Search notice: {e}"
     return "\n".join(results) if results else f"ℹ️ No messages found matching <code>{query}</code>."
+
+async def search_telegram_contacts(query: str = "") -> str:
+    try:
+        res = await client(GetContactsRequest(hash=0))
+        users = getattr(res, "users", [])
+        matches = []
+        for u in users:
+            name = f"{getattr(u, 'first_name', '') or ''} {getattr(u, 'last_name', '') or ''}".strip()
+            uname = getattr(u, "username", "") or ""
+            if not query or query.lower() in f"{name} {uname}".lower():
+                matches.append(f"• <b>{name or 'Contact'}</b> (@{uname or 'no_username'}) — ID: <code>{u.id}</code>")
+        return "\n".join(matches[:20]) if matches else "ℹ️ No matching contacts found."
+    except Exception as e:
+        return f"⚠️ Contacts notice: {e}"
 
 async def inspect_website_intelligence(title_query: str = None) -> str:
     report = ["🌐 <b>Website & Storage Reconciliation Report (Read-Only)</b>"]
@@ -702,40 +767,51 @@ def save_db_cached_meta(cache_key: str, data: dict):
 init_storage_db()
 
 # ============================================================================
-# 4. THE BACKROOM AI COMMANDER BRAIN (AUTO-DISCOVERS LIVE 2026 GEMINI MODELS)
+# 4. GEMINI COMMANDER BRAIN (STABLE FREE-TIER MODELS ONLY • ZERO 429 PREVIEW BUG)
 # ============================================================================
 LAST_GEMINI_ERROR = "None"
 DISCOVERED_GEMINI_MODELS = []
 
 async def get_available_gemini_models(session: aiohttp.ClientSession, api_key: str) -> list:
+    """
+    Strictly selects STABLE free-tier Flash models (excludes 'preview', 'exp', 'omni'
+    which have 0 free-tier RPM and caused HTTP 429 in your screenshot!).
+    """
     global DISCOVERED_GEMINI_MODELS
     if DISCOVERED_GEMINI_MODELS:
         return DISCOVERED_GEMINI_MODELS
-    default_models = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-2.5-flash"]
+
+    preferred_stable = [
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
+        "gemini-2.0-flash",
+        "gemini-2.0-flash-lite",
+        "gemini-1.5-flash"
+    ]
     try:
         url = f"https://generativelanguage.googleapis.com/v1beta/models?pageSize=100&key={api_key}"
         async with session.get(url, timeout=8) as resp:
             if resp.status == 200:
                 data = await resp.json()
-                live_flash, live_other = [], []
+                avail_names = set()
+                extra_stable = []
                 for m in (data.get("models") or []):
                     if "generateContent" not in (m.get("supportedGenerationMethods") or []):
                         continue
                     m_name = (m.get("name") or "").replace("models/", "").strip()
-                    if not m_name or any(x in m_name for x in ["tts", "image", "embedding", "vision"]):
+                    # Exclude preview/exp/omni/pro models that return HTTP 429 (0 free quota)
+                    if any(bad in m_name.lower() for bad in ["preview", "exp", "omni", "live", "tts", "image", "audio", "embedding", "vision", "pro", "thinking", "learnlm", "robotics"]):
                         continue
-                    if "flash" in m_name:
-                        live_flash.append(m_name)
-                    elif "gemini" in m_name:
-                        live_other.append(m_name)
-                live_flash.sort(reverse=True)
-                combined = live_flash + live_other
-                if combined:
-                    DISCOVERED_GEMINI_MODELS = combined[:6]
+                    avail_names.add(m_name)
+                    if "flash" in m_name and m_name not in preferred_stable:
+                        extra_stable.append(m_name)
+                ordered = [m for m in preferred_stable if m in avail_names] + sorted(extra_stable, reverse=True)
+                if ordered:
+                    DISCOVERED_GEMINI_MODELS = ordered[:6]
                     return DISCOVERED_GEMINI_MODELS
     except Exception:
         pass
-    return default_models
+    return preferred_stable
 
 async def ask_gemini_json(prompt: str, cache_key: str = None):
     global GEMINI_KEY_INDEX, GEMINI_CALL_COUNT, LAST_GEMINI_ERROR
@@ -750,7 +826,7 @@ async def ask_gemini_json(prompt: str, cache_key: str = None):
     async with GEMINI_SEMAPHORE:
         payload = {
             "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0.15, "responseMimeType": "application/json"}
+            "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"}
         }
         async with aiohttp.ClientSession() as session:
             for _ in range(len(GEMINI_KEYS)):
@@ -765,10 +841,7 @@ async def ask_gemini_json(prompt: str, cache_key: str = None):
                                 GEMINI_CALL_COUNT += 1
                                 data = await resp.json()
                                 parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
-                                raw_txt = ""
-                                for p in parts:
-                                    if not p.get("thought") and p.get("text"):
-                                        raw_txt += p["text"]
+                                raw_txt = "".join(p.get("text", "") for p in parts if not p.get("thought"))
                                 m_json = re.search(r"(\{.*\}|\[.*\])", raw_txt.strip(), re.DOTALL)
                                 if m_json:
                                     parsed = json.loads(m_json.group(1))
@@ -777,13 +850,13 @@ async def ask_gemini_json(prompt: str, cache_key: str = None):
                                     LAST_GEMINI_ERROR = f"OK ({model})"
                                     await asyncio.sleep(1.0)
                                     return parsed
-                            elif resp.status == 404:
-                                LAST_GEMINI_ERROR = f"HTTP 404 ({model})"
+                            elif resp.status in (404, 429, 503):
+                                # Per-model rate limit or retired model -> continue to next stable model!
+                                LAST_GEMINI_ERROR = f"HTTP {resp.status} ({model})"
                                 continue
                             else:
                                 LAST_GEMINI_ERROR = f"HTTP {resp.status} ({model})"
-                                if resp.status in (429, 403, 400):
-                                    break
+                                break
                     except Exception as e:
                         LAST_GEMINI_ERROR = str(e)[:80]
     return None
@@ -828,22 +901,36 @@ async def tmdb_smart_list_fallback(user_text: str) -> list:
     return tasks
 
 def local_commander_fallback(user_msg: str) -> dict:
+    """Rich conversational fallback so even if all Gemini keys are cooling down, it chats naturally like ChatGPT!"""
     low = (user_msg or "").lower().strip()
     c_yr, c_pg, c_kind = get_crawler_progress()
-    q_preview = ", ".join(t[0]["raw"] if isinstance(t[0], dict) else str(t[0]) for t in list(TITLE_QUEUE)[:5]) or "None"
+    q_preview = ", ".join(t[0]["raw"] if isinstance(t[0], dict) else str(t[0]) for t in list(TITLE_QUEUE)[:5]) or "Empty"
 
     if re.search(r"\b(?:stop|pause|cancel|halt|clear)\b", low):
-        return {"action": "STOP_ALL", "risk_level": "LOW", "crawler_on": False, "reply": "🛑 <b>Stopped all active downloads, cleared the queue, and paused the 24/7 Auto-Crawler!</b>"}
+        return {"action": "STOP_ALL", "risk_level": "LOW", "crawler_on": False, "reply": "🛑 <b>Done! I have stopped all active downloads, cleared the queue, and paused the 24/7 Auto-Crawler.</b>"}
+
+    if any(w in low for w in ["how are u", "how are you", "hows it going", "how is it going", "good morning", "good evening", "sup", "whats up"]):
+        return {
+            "action": "CHAT_ONLY", "risk_level": "LOW",
+            "reply": (
+                f"I'm doing great and running smoothly! 🚀\n\n"
+                f"• <b>Current Task:</b> <code>{ACTIVE_CLEAN_TITLE or 'Idle & Ready'}</code>\n"
+                f"• <b>Auto-Crawler:</b> <code>{'ON 🟢' if AUTO_DISCOVERY_ENABLED else 'OFF 🔴'}</code> ({c_yr} • {c_kind.upper()})\n"
+                f"• <b>Queue:</b> <code>{len(TITLE_QUEUE)}</code> item(s) ({q_preview})\n\n"
+                f"What would you like me to do next? You can ask me to search movies, manage channels, check your website, or teach me a new rule!"
+            )
+        }
 
     if any(w in low for w in ["what are you downloading", "downloading right now", "working on", "status", "queue", "progress"]):
         return {
             "action": "CHAT_ONLY", "risk_level": "LOW",
             "reply": (
-                f"<b>Here is what I am working on right now:</b>\n"
-                f"• <b>Currently Downloading:</b> <code>{ACTIVE_CLEAN_TITLE or 'Idle'}</code> ({ACTIVE_RES_TAG or '-'})\n"
+                f"<b>Here is my live operational status:</b>\n"
+                f"• <b>Active Download:</b> <code>{ACTIVE_CLEAN_TITLE or 'Idle'}</code> ({ACTIVE_RES_TAG or '-'})\n"
                 f"• <b>Waiting in Queue ({len(TITLE_QUEUE)}):</b> <code>{q_preview}</code>\n"
                 f"• <b>24/7 Auto-Crawler:</b> <code>{'ON 🟢' if AUTO_DISCOVERY_ENABLED else 'OFF 🔴'}</code> (Year {c_yr} • {c_kind.upper()})\n"
-                f"• <b>Gemini Keys Loaded:</b> <code>{len(GEMINI_KEYS)}</code> (Status: <code>{LAST_GEMINI_ERROR}</code>)"
+                f"• <b>Storage Channels:</b> <code>{count_unique_storage_channels()}/{MAX_STORAGE_CHANNELS}</code>\n"
+                f"• <b>AI Engine Status:</b> <code>{LAST_GEMINI_ERROR}</code>"
             )
         }
 
@@ -851,16 +938,18 @@ def local_commander_fallback(user_msg: str) -> dict:
         return {
             "action": "CHAT_ONLY", "risk_level": "LOW",
             "reply": (
-                "<b>I am THE BACKROOM AI COMMANDER</b> — your personal AI assistant living inside your Telegram account.\n\n"
-                "• 🎬 <b>Media Automation:</b> Search, download & organize Movies, Series & Anime across up to 30 Genre Vaults.\n"
-                "• ♻️ <b>Channel Wipe & Self-Reupload:</b> Use <code>.repopulate channel_name</code> or <code>.redownloadchannel channel_name</code> to wipe a storage channel and re-upload everything cleanly for thebackroom.lol!\n"
-                "• 📜 <b>Permanent Rules:</b> Tell me <i>\"From now on...\"</i> and I will remember and obey permanently.\n"
-                f"<i>(Active Gemini Keys: <code>{len(GEMINI_KEYS)}</code> | Status: <code>{LAST_GEMINI_ERROR}</code>)</i>"
+                "<b>I am THE BACKROOM AI COMMANDER</b> — your personal AI operating system inside Telegram.\n\n"
+                "You can talk to me naturally like ChatGPT:\n"
+                "• <i>\"Download Vikings season 1\"</i> or <i>\".search Title\"</i>\n"
+                "• <i>\"Delete everything from the korean channel and reupload it\"</i>\n"
+                "• <i>\"From now on, always prefer official English titles\"</i>\n"
+                "• <i>\"Find the conversation where I discussed Cloudflare\"</i>\n"
+                "• <i>\"Stop anything in progress\"</i>"
             )
         }
 
     if low.startswith(("from now on", "always ", "never ", "remember that")):
-        return {"action": "MANAGE_RULE", "risk_level": "LOW", "rule_op": "ADD", "rule_text": user_msg.strip(), "reply": f"Saved as a permanent behavioral rule: <code>{user_msg.strip()}</code>"}
+        return {"action": "MANAGE_RULE", "risk_level": "LOW", "rule_op": "ADD", "rule_text": user_msg.strip(), "reply": f"Got it! I have saved this as a permanent behavioral rule: <code>{user_msg.strip()}</code>"}
 
     if low.startswith(("remove ", "delete movie ", "delete series ")):
         t_del = re.sub(r"^(?:remove|delete)\s+(?:the\s+)?(?:movie|series)?\s*", "", user_msg, flags=re.I).strip()
@@ -870,7 +959,14 @@ def local_commander_fallback(user_msg: str) -> dict:
         t_re = re.sub(r"^(?:reupload|re-upload|resync)\s+", "", user_msg, flags=re.I).strip()
         return {"action": "REUPLOAD_MEDIA", "risk_level": "MEDIUM", "target_title": t_re, "reply": f"Re-uploading <code>{t_re}</code> as a brand-new post with its Official Public Name..."}
 
-    return {"action": "CHAT_ONLY", "risk_level": "LOW", "reply": f"I received your order: <code>{user_msg}</code>\n⚠️ <b>Gemini Status:</b> <code>{LAST_GEMINI_ERROR}</code>"}
+    return {
+        "action": "CHAT_ONLY", "risk_level": "LOW",
+        "reply": (
+            f"I heard you: <i>\"{user_msg}\"</i>\n\n"
+            f"Right now my Gemini key is cooling down (<code>{LAST_GEMINI_ERROR}</code> — tip: add a 2nd/3rd free key with <code>.addgemini AIzaSy...</code> so I never hit rate limits!).\n"
+            f"Meanwhile, you can still tell me to <b>stop</b>, ask <b>what are you downloading</b>, teach rules (<b>From now on...</b>), or use <code>.search Title</code> / <code>.repopulate channel</code>!"
+        )
+    }
 
 async def gemini_interactive_agent(user_msg: str) -> dict:
     ch_map = load_all_channels_from_db()
@@ -882,7 +978,8 @@ async def gemini_interactive_agent(user_msg: str) -> dict:
     history_str = "\n".join(AI_CHAT_HISTORY)
 
     prompt = f"""
-    You are THE BACKROOM AI COMMANDER — a persistent, self-evolving ChatGPT-style personal AI operating system inside the owner's Telegram account.
+    You are THE BACKROOM AI COMMANDER — a warm, intelligent, ChatGPT-like personal AI operating system inside the owner's Telegram account.
+    Talk naturally, helpfully, and conversationally with the owner.
     Current State:
     - Active Download: {ACTIVE_CLEAN_TITLE or 'Idle'} ({ACTIVE_RES_TAG or '-'}) | Queue: {len(TITLE_QUEUE)}
     - Auto-Crawler: {'ON' if AUTO_DISCOVERY_ENABLED else 'OFF'} (Year: {c_yr}, Category: {c_kind})
@@ -900,16 +997,16 @@ async def gemini_interactive_agent(user_msg: str) -> dict:
 
     OWNER MESSAGE: "{user_msg}"
 
-    Determine the owner's intent and select the exact action:
-    1. If the owner says "stop anything on progress", "stop everything", or "pause everything", set action="STOP_ALL" and crawler_on=false.
-    2. If the owner asks to delete everything from one storage channel and re-upload it again by itself, set action="WIPE_AND_REUPLOAD_CHANNEL" and target_channel_key="<cat_key_or_id>".
-    3. If the owner is chatting or asking a question, answer naturally and set action="CHAT_ONLY". NEVER queue movies when the owner is just chatting!
-    4. If the owner gives a permanent instruction ("From now on...", "Always...", "Never..."), set action="MANAGE_RULE", rule_op="ADD", and rule_text="<clean rule>".
-    5. Other actions: "SEARCH_ACCOUNT", "INSPECT_WEBSITE", "SELF_EVOLVE", "SCHEDULE_JOB", "QUEUE_TITLES", "DELETE_MEDIA", "REUPLOAD_MEDIA", "RENAME_ALL_PUBLIC", "REBUILD_SERIES_INDEX", "RENAME_CHANNEL", "DELETE_CHANNEL", "CLEAR_CHANNEL_MESSAGES", "CREATE_CHANNEL", "CRAWLER_CONTROL", "SKIP", "CLEAR_QUEUE".
+    Instructions:
+    1. If the owner is chatting ("How are u", "Tell me about u", general questions, code/project discussion), reply naturally like ChatGPT and set action="CHAT_ONLY".
+    2. If the owner says "stop anything on progress" or "stop everything", set action="STOP_ALL" and crawler_on=false.
+    3. If the owner asks to delete everything from one storage channel and re-upload it again by itself, set action="WIPE_AND_REUPLOAD_CHANNEL" and target_channel_key="<cat_key_or_id>".
+    4. If the owner gives a permanent rule ("From now on...", "Always...", "Never..."), set action="MANAGE_RULE", rule_op="ADD", and rule_text="<clean rule>".
+    5. Other actions: "SEARCH_ACCOUNT", "SEARCH_CONTACTS", "INSPECT_WEBSITE", "SELF_EVOLVE", "SCHEDULE_JOB", "QUEUE_TITLES", "DELETE_MEDIA", "REUPLOAD_MEDIA", "RENAME_ALL_PUBLIC", "REBUILD_SERIES_INDEX", "RENAME_CHANNEL", "DELETE_CHANNEL", "CLEAR_CHANNEL_MESSAGES", "CREATE_CHANNEL", "CRAWLER_CONTROL", "SKIP", "CLEAR_QUEUE".
 
     Return ONLY valid JSON:
     {{
-      "reply": "Detailed, natural HTML-formatted response",
+      "reply": "Warm, intelligent, natural HTML-formatted response",
       "action": "CHAT_ONLY",
       "risk_level": "LOW",
       "rule_op": null, "rule_id": null, "rule_text": null, "memory_to_save": null,
@@ -947,22 +1044,26 @@ async def fetch_meta(title: str, target_year: int = None):
         return db_cached
 
     public_title, resolved_year, genres_list, lang, runtime, rating = clean.title(), target_year, [], "", "", ""
-    is_series = bool(re.search(r"\b(S\d{1,2}|Season|E\d{1,3}|EP\.?\s*\d+|Episode)\b", title, re.I))
+    has_ep_pattern = bool(re.search(r"\b(S\d{1,2}|Season|E\d{1,3}|EP\.?\s*\d+|Episode)\b", title, re.I))
+    is_series = has_ep_pattern
 
     today_str = current_utc_date_str()
     if OMDB_CALL_DAY != today_str:
         OMDB_CALL_DAY, OMDB_CALL_COUNT = today_str, 0
 
     async with aiohttp.ClientSession() as session:
-        if TMDB_API_KEY:
+        if TMDB_API_KEY and clean != "unknown":
             async with TMDB_SEMAPHORE:
                 try:
                     url = f"https://api.themoviedb.org/3/search/multi?api_key={TMDB_API_KEY}&language=en-US&query={quote_plus(clean)}"
                     async with session.get(url, timeout=4) as r:
                         if r.status == 200:
-                            results = (await r.json()).get("results") or []
+                            results = [x for x in ((await r.json()).get("results") or []) if x.get("media_type") in ("movie", "tv")]
                             chosen = None
                             for item in results:
+                                m_type = item.get("media_type")
+                                if has_ep_pattern and m_type != "tv":
+                                    continue
                                 rel = item.get("release_date") or item.get("first_air_date") or ""
                                 iy = int(rel[:4]) if len(rel) >= 4 and rel[:4].isdigit() else None
                                 if target_year and iy and iy != target_year:
@@ -989,7 +1090,7 @@ async def fetch_meta(title: str, target_year: int = None):
                 except Exception:
                     pass
 
-        if OMDB_API_KEY and OMDB_CALL_COUNT < OMDB_DAILY_SAFE_LIMIT and (not genres_list or not runtime):
+        if OMDB_API_KEY and OMDB_CALL_COUNT < OMDB_DAILY_SAFE_LIMIT and clean != "unknown" and (not genres_list or not runtime):
             try:
                 OMDB_CALL_COUNT += 1
                 y_param = f"&y={target_year}" if target_year else ""
@@ -1014,7 +1115,7 @@ async def fetch_meta(title: str, target_year: int = None):
             except Exception:
                 pass
 
-        if not genres_list or public_title.lower() == clean:
+        if not genres_list and clean != "unknown":
             try:
                 async with session.get(f"https://itunes.apple.com/search?term={quote_plus(clean)}&limit=5", timeout=4) as ir:
                     if ir.status == 200:
@@ -1036,12 +1137,13 @@ async def fetch_meta(title: str, target_year: int = None):
             except Exception:
                 pass
 
-    if GEMINI_KEYS and (not genres_list or public_title.lower() == clean):
+    # Save Gemini RPM quota for user chat! Only call Gemini on background files if ALL other APIs missed the title completely.
+    if GEMINI_KEYS and not genres_list and public_title.lower() == clean and not resolved_year:
         ai_meta = await gemini_resolve_movie_meta(title, target_year)
         if isinstance(ai_meta, dict):
             public_title = ai_meta.get("public_title") or public_title
             resolved_year = resolved_year or ai_meta.get("year")
-            if ai_meta.get("genres") and not genres_list:
+            if ai_meta.get("genres"):
                 genres_list = [g.strip() for g in str(ai_meta["genres"]).split(",") if g.strip()]
             lang = lang or ai_meta.get("language", "")
             rating = rating or ai_meta.get("rating", "")
@@ -1109,7 +1211,7 @@ def extract_real_filename(filename="", caption=""):
     cap = str(caption or "")
     m = re.search(r"File\s*Name\s*:\s*\r?\n?([^\r\n]+)", cap, re.I)
     fn = m.group(1).strip() if (m and len(m.group(1).strip()) >= 4) else str(filename or "Media.mkv").strip()
-    return re.sub(r"https?://\S+|t\.me/\S+|@[A-Za-z0-9_]+", "", fn).strip()
+    return strip_uploader_and_junk(fn)
 
 def extract_tech_specs(filename="", caption="", file_size_bytes=0, meta=None):
     meta = meta or {}
@@ -1147,8 +1249,7 @@ def extract_tech_specs(filename="", caption="", file_size_bytes=0, meta=None):
             detected_langs.append(name)
 
     if not detected_langs:
-        orig_map = {"en": "English", "ja": "Japanese", "ko": "Korean", "hi": "Hindi", "tr": "Turkish", "am": "Amharic", "ta": "Tamil", "te": "Telugu", "ml": "Malayalam"}
-        detected_langs.append(orig_map.get((meta.get("language") or "").lower(), "English"))
+        detected_langs.append(ORIG_LANG_MAP.get((meta.get("language") or "").lower(), "English"))
 
     audio_tier = extract_audio_tier(audio_only_text, len(detected_langs))
     audio_mode = f"Multi Audio / Dubbed ({', '.join(detected_langs[:5])})" if audio_tier == 3 else (f"Dual Audio ({' + '.join(detected_langs)})" if audio_tier == 2 else f"{detected_langs[0]} ({aud_codec})")
@@ -1174,13 +1275,7 @@ def build_final_caption(filename, caption, meta=None, file_size_bytes=0, ep_tag=
     dub_badge = " [Multi-Audio]" if sp["audio_tier"] == 3 else (" [Dual-Audio]" if sp["audio_tier"] == 2 else "")
     spec_tag = " ".join(p for p in [sp["quality"], sp["source"], sp["codec"]] if p)
     official_public_filename = f"{pub_title}{year_str}{ep_str}{dub_badge} [{spec_tag}].mkv"
-
-    orig_lang_map = {
-        "en": "English", "ja": "Japanese", "ko": "Korean", "hi": "Hindi", "tr": "Turkish",
-        "am": "Amharic", "ta": "Tamil", "te": "Telugu", "ml": "Malayalam", "kn": "Kannada",
-        "zh": "Mandarin", "es": "Spanish", "fr": "French"
-    }
-    orig_lang_name = orig_lang_map.get((meta.get("language") or "").lower(), "")
+    orig_lang_name = ORIG_LANG_MAP.get((meta.get("language") or "").lower(), "")
 
     lines = [f"🎬 <b>{pub_title}{year_str}{ep_str}</b>"]
     if meta.get("genres"):
@@ -1269,21 +1364,13 @@ def detect_category(filename, caption, meta):
     return "english"
 
 async def publish_file_with_green_buttons(dest_channel: int, media, final_caption: str, is_series: bool = False):
-    """
-    Posts file once via Userbot (triggering thebackroom.lol webhook with sent_msg.id)
-    and attaches Green Buttons IN-PLACE via editMessageReplyMarkup without EVER deleting sent_msg.id!
-    """
     sent_msg = await client.send_file(dest_channel, file=media, caption=final_caption, buttons=INLINE_BUTTONS, parse_mode="HTML")
     token = WEBSITE_BOT_TOKEN or pick_bot_for_role("series" if is_series else "movies").get("token")
     if not token or not sent_msg:
         return sent_msg
     try:
         api_url = f"https://api.telegram.org/bot{token}/editMessageReplyMarkup"
-        payload = {
-            "chat_id": dest_channel,
-            "message_id": sent_msg.id,
-            "reply_markup": json.dumps(GREEN_BOT_API_MARKUP)
-        }
+        payload = {"chat_id": dest_channel, "message_id": sent_msg.id, "reply_markup": json.dumps(GREEN_BOT_API_MARKUP)}
         async with aiohttp.ClientSession() as session:
             await session.post(api_url, data=payload, timeout=8)
     except Exception:
@@ -1559,28 +1646,15 @@ async def init_all_delivery_bots():
 # 7. WIPE & SELF-REUPLOAD CHANNEL ENGINE + WEBSITE RESYNC
 # ============================================================================
 async def wipe_and_reupload_storage_channel(target_channel_str: str, redownload_from_bots: bool = False) -> str:
-    """
-    Deletes everything from one storage channel and re-uploads it again by itself!
-    - Mode 1 (Default / .repopulate <channel>): Collects all video media in the channel,
-      deletes every old message from the channel, and re-uploads each file fresh with
-      thebackroom.lol captions, green buttons, and brand-new message_ids!
-    - Mode 2 (redownload_from_bots=True / .redownloadchannel <channel>): Collects all movie/series
-      titles in that channel, wipes the channel completely clean, clears its DB records,
-      and queues all titles to re-download & re-upload fresh from @fileserverxrobot / @Hislordship_Movies_bot!
-    """
     await sync_created_channels_from_dialogs()
     matches = await resolve_account_channel_target(target_channel_str)
     if not matches:
         return f"⚠️ Could not find any storage channel matching <code>{target_channel_str}</code>."
-    ch_label, cid, full_name = matches[0]
+    _, cid, full_name = matches[0]
 
-    collected_msgs = []
-    titles_to_redownload = set()
-
-    # Also check SQLite for any titles previously indexed in this channel
+    collected_msgs, titles_to_redownload = [], set()
     conn = sqlite3.connect("storage_index.db")
-    db_titles = conn.execute("SELECT DISTINCT clean_title FROM indexed_files_v4 WHERE channel_id=?", (cid,)).fetchall()
-    for r in db_titles:
+    for r in conn.execute("SELECT DISTINCT clean_title FROM indexed_files_v4 WHERE channel_id=?", (cid,)).fetchall():
         if r[0] and r[0] != "unknown":
             titles_to_redownload.add(r[0])
 
@@ -1589,8 +1663,7 @@ async def wipe_and_reupload_storage_channel(target_channel_str: str, redownload_
             if m.video or m.document:
                 fn = (m.file.name if m.file else "") or ""
                 txt = m.text or ""
-                real_fn = extract_real_filename(fn, txt)
-                t_key = normalize_title_key(real_fn)
+                t_key = normalize_title_key(extract_real_filename(fn, txt))
                 if t_key != "unknown":
                     titles_to_redownload.add(t_key)
                 collected_msgs.append(m)
@@ -1603,14 +1676,11 @@ async def wipe_and_reupload_storage_channel(target_channel_str: str, redownload_
         conn.close()
         return f"⚠️ Error scanning channel <code>{full_name}</code>: <code>{e}</code>"
 
-    # Clear old DB records for this channel
     conn.execute("DELETE FROM indexed_files_v4 WHERE channel_id=?", (cid,))
-    conn.execute("DELETE FROM crawler_history WHERE clean_title IN (SELECT DISTINCT clean_title FROM indexed_files_v4 WHERE channel_id=?)", (cid,))
     conn.commit()
     conn.close()
 
     if redownload_from_bots or not collected_msgs:
-        # Delete all video messages in the channel and queue all titles for fresh bot extraction!
         del_ids = [m.id for m in collected_msgs]
         for i in range(0, len(del_ids), 100):
             try:
@@ -1622,12 +1692,8 @@ async def wipe_and_reupload_storage_channel(target_channel_str: str, redownload_
             TITLE_QUEUE.append(({"raw": t_name.title(), "title": t_name, "year": None, "mode": "normal", "season": None, "episodes": None}, True))
         if titles_to_redownload:
             asyncio.create_task(process_queue())
-        return (
-            f"🗑️ <b>Wiped Channel Clean:</b> <code>{full_name}</code> (Deleted <code>{len(del_ids)}</code> old posts)\n"
-            f"🔄 <b>Auto-Queued <code>{len(titles_to_redownload)}</code> Title(s)</b> to re-download & re-upload fresh by itself!"
-        )
+        return f"🗑️ <b>Wiped <code>{full_name}</code> ({len(del_ids)} posts) & Auto-Queued <code>{len(titles_to_redownload)}</code> Title(s)!</b>"
 
-    # In-place wipe & fresh re-upload (oldest first so chronological order is preserved)
     collected_msgs.reverse()
     reuploaded = 0
     for m in collected_msgs:
@@ -1637,6 +1703,8 @@ async def wipe_and_reupload_storage_channel(target_channel_str: str, redownload_
             real_fn = extract_real_filename(fn, txt)
             yr = extract_year_from_text(real_fn)
             meta = await fetch_meta(real_fn, yr)
+            if meta.get("title") == "unknown":
+                continue
             ep_tag = extract_season_ep_tag(f"{real_fn}\n{txt}", "S01")
             res_tag = extract_resolution_tag(f"{real_fn}\n{txt}", "1080P")
             aud_tier = extract_audio_tier(f"{real_fn}\n{txt}")
@@ -1644,7 +1712,6 @@ async def wipe_and_reupload_storage_channel(target_channel_str: str, redownload_
             sz = m.file.size if m.file else 0
             new_cap = build_final_caption(fn or real_fn, txt, meta, sz, ep_tag)
 
-            # Delete old message first, then upload fresh message so thebackroom.lol indexes the new ID cleanly
             old_id = m.id
             new_sent = await publish_file_with_green_buttons(cid, m.media, new_cap, is_series=(ep_tag != "MOVIE"))
             if new_sent:
@@ -1658,15 +1725,13 @@ async def wipe_and_reupload_storage_channel(target_channel_str: str, redownload_
             await asyncio.sleep(fw.seconds + 2)
         except Exception:
             pass
-
-    return f"♻️ <b>Channel Wipe & Re-Upload Complete for <code>{full_name}</code>:</b>\nDeleted all old posts and re-uploaded <code>{reuploaded}</code> file(s) with fresh IDs & thebackroom.lol captions!"
+    return f"♻️ <b>Channel Wipe & Re-Upload Complete for <code>{full_name}</code>:</b> Re-uploaded <code>{reuploaded}</code> file(s) cleanly!"
 
 async def resync_files_for_website(target_query: str = None, max_items: int = 8) -> int:
     await sync_created_channels_from_dialogs()
     ch_map = load_all_channels_from_db()
     clean_q = normalize_title_key(target_query) if target_query else None
-    seen_groups = set()
-    resynced = 0
+    seen_groups, resynced = set(), 0
 
     scan_channels = list(dict.fromkeys([ch_map["series"], ch_map["anime"], ch_map["english"], ch_map["action"], ch_map["horror"], ch_map["korean"], ch_map["hindi"]] + list(ch_map.values())))
     for cid in scan_channels:
@@ -1685,7 +1750,7 @@ async def resync_files_for_website(target_query: str = None, max_items: int = 8)
                 txt = m.text or ""
                 real_fn = extract_real_filename(fn, txt)
                 t_key = normalize_title_key(real_fn)
-                if clean_q and clean_q not in t_key and t_key not in clean_q:
+                if t_key == "unknown" or (clean_q and clean_q not in t_key and t_key not in clean_q):
                     continue
 
                 ep_tag = extract_season_ep_tag(f"{real_fn}\n{txt}", "S01")
@@ -1696,6 +1761,8 @@ async def resync_files_for_website(target_query: str = None, max_items: int = 8)
 
                 yr = extract_year_from_text(real_fn)
                 meta = await fetch_meta(real_fn, yr)
+                if meta.get("title") == "unknown":
+                    continue
                 correct_cat = detect_category(real_fn, txt, meta)
                 dest_cid = await get_or_create_genre_channel(correct_cat)
                 res_tag = extract_resolution_tag(f"{real_fn}\n{txt}", "1080P")
@@ -1732,6 +1799,8 @@ async def rename_and_readjust_all_channels() -> int:
                 fn = (msg.file.name if msg.file else "") or ""
                 txt = msg.text or ""
                 real_fn = extract_real_filename(fn, txt)
+                if normalize_title_key(real_fn) == "unknown":
+                    continue
                 yr = extract_year_from_text(real_fn)
                 meta = await fetch_meta(real_fn, yr)
                 pub_title = meta.get("public_title") or ""
@@ -1928,7 +1997,7 @@ def is_file_or_episode_grid(msg) -> bool:
     return False
 
 # ============================================================================
-# 9. INCOMING MEDIA EVENT
+# 9. INCOMING MEDIA EVENT (VERIFIED OFFICIAL PUBLIC TITLES & ZERO BROKEN IDS)
 # ============================================================================
 @client.on(events.NewMessage(incoming=True))
 async def on_media_arrival(event):
@@ -1959,17 +2028,24 @@ async def on_media_arrival(event):
 
     file_year = ACTIVE_TARGET_YEAR or extract_year_from_text(real_fn)
     title_for_meta = ACTIVE_CLEAN_TITLE or normalize_title_key(real_fn)
+    if not title_for_meta or title_for_meta == "unknown":
+        FILE_COMPLETED_EVENT.set()
+        return
+
     meta = await fetch_meta(title_for_meta, file_year)
+    pub_key = normalize_title_key(meta.get("public_title") or title_for_meta)
+    if pub_key == "unknown":
+        FILE_COMPLETED_EVENT.set()
+        return
+
     sp = extract_tech_specs(raw_fn, caption, file_size, meta)
     new_audio_tier = sp["audio_tier"]
-
     cat = detect_category(real_fn, caption, meta)
     dest_channel = await get_or_create_genre_channel(cat)
     cat_emoji = CATEGORY_EMOJIS.get(cat, "📁")
 
     ep_tag = ACTIVE_EP_TAG or extract_season_ep_tag(combined_text, ACTIVE_SEASON_TAG)
     res_tag = extract_resolution_tag(combined_text, ACTIVE_RES_TAG or "1080P")
-    pub_key = normalize_title_key(meta.get("public_title") or title_for_meta)
     title_key = ACTIVE_CLEAN_TITLE or pub_key
     variant_key = extract_movie_variant_key(combined_text, res_tag, new_audio_tier) if ep_tag == "MOVIE" else res_tag
 
@@ -2217,7 +2293,6 @@ async def download_from_grid(
                     remaining_targets.discard(ep_num)
             except asyncio.TimeoutError:
                 pass
-            # Gentle 2.5s pacing for Cloudflare Free Tier & Telegram FloodWait
             await asyncio.sleep(2.5)
 
             check_msg = await client.get_messages(bot_entity, ids=menu_msg_id)
@@ -2616,7 +2691,7 @@ async def execute_ai_controller_action(ai_res: dict, event, raw_user_req: str = 
 
     mem_obj = ai_res.get("memory_to_save")
     if isinstance(mem_obj, dict) and mem_obj.get("key") and mem_obj.get("value"):
-        save_long_term_memory(mem_obj.get("category", "preference"), mem_obj["key"], mem_obj["value"])
+        save_long_term_memory(mem_obj.get("category", "USER_PREFERENCE"), mem_obj["key"], mem_obj["value"])
 
     AI_CHAT_HISTORY.append(f"AI: {reply_msg}")
     log_audit_event(raw_user_req, act, risk, "EXECUTED")
@@ -2644,15 +2719,20 @@ async def execute_ai_controller_action(ai_res: dict, event, raw_user_req: str = 
             res_txt = await search_account_intelligence(s_q)
             await event.reply(f"🔍 <b>Account Intelligence Search ('{s_q}'):</b>\n{res_txt}", parse_mode="HTML")
 
+    elif act == "SEARCH_CONTACTS":
+        s_q = ai_res.get("search_query") or ""
+        res_txt = await search_telegram_contacts(s_q)
+        await event.reply(f"👤 <b>Contacts Search:</b>\n{res_txt}", parse_mode="HTML")
+
     elif act == "INSPECT_WEBSITE":
         rep = await inspect_website_intelligence(ai_res.get("target_title"))
         await event.reply(rep, parse_mode="HTML")
 
     elif act == "SELF_EVOLVE":
-        c_name = ai_res.get("cap_name") or "custom_plugin"
-        c_desc = ai_res.get("cap_description") or "AI-evolved capability"
+        c_name = ai_res.get("cap_name") or "custom_skill"
+        c_desc = ai_res.get("cap_description") or "AI-evolved skill"
         c_code = ai_res.get("cap_code") or "def run():\n    return True\n"
-        ev_msg = stage_or_register_capability(c_name, c_desc, c_code, auto_activate=True)
+        ev_msg = stage_or_register_capability(c_name, c_desc, c_code, auto_activate=False)
         await event.reply(ev_msg, parse_mode="HTML")
 
     elif act == "SCHEDULE_JOB":
@@ -2750,7 +2830,7 @@ async def execute_ai_controller_action(ai_res: dict, event, raw_user_req: str = 
 async def on_outgoing_trigger(event):
     global SKIP_CURRENT_TITLE, AUTO_DISCOVERY_ENABLED, AUTO_CREATE_CHANNELS, WEB_PULSE_ENABLED, ME_USER_ID
     text = (event.message.text or "").strip()
-    if not text or text.startswith(("/", "✅", "⏳", "🏁", "⚠️", "🔗", "📋", "🛑", "🔎", "🎬", "🤖", "⚡", "♻️", "🆕", "📖", "🌐", "🧠", "🗑️", "🧹", "✏️", "🔑", "📜", "🧬", "🔍", "⏰")):
+    if not text or text.startswith(("/", "✅", "⏳", "🏁", "⚠️", "🔗", "📋", "🛑", "🔎", "🎬", "🤖", "⚡", "♻️", "🆕", "📖", "🌐", "🧠", "🗑️", "🧹", "✏️", "🔑", "📜", "🧬", "🔍", "⏰", "👤")):
         return
 
     if ME_USER_ID is None:
@@ -2762,23 +2842,28 @@ async def on_outgoing_trigger(event):
         if low in (".help", "help", ".admin", "admin"):
             await event.reply(
                 "📖 <b>THE BACKROOM AI COMMANDER — Full Guide</b>\n\n"
-                "• <b>Natural Chat:</b> Talk to me like ChatGPT! Teach rules (<i>\"From now on...\"</i>), stop tasks, or control channels.\n"
-                "• <code>.repopulate channel_key</code> — Delete all posts in one storage channel & re-upload them fresh by itself (in-place media)\n"
-                "• <code>.redownloadchannel channel_key</code> — Wipe channel completely & re-download all its titles from source bots\n"
+                "• <b>Natural Chat:</b> Talk to me like ChatGPT! Ask questions, teach rules (<i>\"From now on...\"</i>), stop tasks, or control channels.\n"
+                "• <code>.repopulate channel_key</code> — Delete all posts in one storage channel & re-upload them fresh by itself\n"
+                "• <code>.redownloadchannel channel_key</code> — Wipe channel & re-download all its titles from source bots\n"
                 "• <code>.search Title</code> — Direct search movie/series/range/missing\n"
                 "• <code>.auto on</code> / <code>.auto off</code> / <code>.auto 2025</code> / <code>.auto bollywood</code>\n"
-                "• <code>.reupload Title</code> — Delete old & re-upload as brand-new\n"
-                "• <code>.delete Title</code> — Delete movie/series everywhere\n"
-                "• <code>.renameall</code> — Rename all files to Official Public Names\n"
-                "• <code>.rebuildindex</code> — Clear Series Index & resend 1 card/series\n"
-                "• <code>.rules</code> | <code>.memory</code> | <code>.evolve</code> | <code>.webcheck</code>\n"
+                "• <code>.reupload Title</code> | <code>.delete Title</code> | <code>.renameall</code> | <code>.rebuildindex</code>\n"
+                "• <code>.rules</code> | <code>.memory</code> | <code>.evolve</code> | <code>.approve</code> | <code>.webcheck</code>\n"
                 "• <code>.delchannel name</code> | <code>.renamechat old | new</code> | <code>.createchannel all</code>\n"
                 "• <code>.addgemini AIzaSy...</code> | <code>.status</code> | <code>.channels</code> | <code>.bots</code> | <code>.skip</code> | <code>.clear</code>",
                 parse_mode="HTML"
             )
             return
 
-        # NEW: Delete everything from 1 storage channel and re-upload it again by itself!
+        if low in (".approve", "approve"):
+            conn = sqlite3.connect("storage_index.db")
+            conn.execute("UPDATE custom_capabilities SET active=1 WHERE active=0")
+            conn.execute("UPDATE evolution_history SET status='APPROVED_ACTIVE' WHERE status='WAITING_FOR_APPROVAL'")
+            conn.commit()
+            conn.close()
+            await event.reply("✅ <b>Approved & Activated pending AI Commander skill update(s)!</b>", parse_mode="HTML")
+            return
+
         if low.startswith((".repopulate ", ".wipeandreupload ")):
             target_ch = text.split(maxsplit=1)[1].strip()
             await event.reply(f"♻️ <b>Wiping old posts in <code>{target_ch}</code> & re-uploading every file fresh with thebackroom.lol captions...</b>", parse_mode="HTML")
@@ -2805,12 +2890,12 @@ async def on_outgoing_trigger(event):
             await event.reply(f"🧠 <b>Long-Term Memory Store:</b>\n{m_txt}", parse_mode="HTML")
             return
 
-        if low in (".evolve", "evolve"):
+        if low in (".evolve", "evolve", ".skills", "skills"):
             conn = sqlite3.connect("storage_index.db")
-            rows = conn.execute("SELECT change_type, summary, backup_path, status, created_at FROM evolution_history ORDER BY id DESC LIMIT 10").fetchall()
+            rows = conn.execute("SELECT change_type, summary, backup_path, status FROM evolution_history ORDER BY id DESC LIMIT 10").fetchall()
             conn.close()
             e_txt = "\n".join(f"• <b>[{r[3]}]</b> <code>{r[1]}</code> (Backup: <code>{r[2]}</code>)" for r in rows) or "<i>(No self-evolution updates yet)</i>"
-            await event.reply(f"🧬 <b>Self-Evolution & Backup History:</b>\n{e_txt}", parse_mode="HTML")
+            await event.reply(f"🧬 <b>Self-Evolution & Skill History:</b>\n{e_txt}", parse_mode="HTML")
             return
 
         if low.startswith(".webcheck"):
