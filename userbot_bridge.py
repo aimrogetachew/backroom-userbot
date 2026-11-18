@@ -208,8 +208,10 @@ def normalize_title_key(title: str) -> str:
     s = re.sub(r"['’`]", "", s)
     s = re.sub(r"[._\-·•]+", " ", s).strip()
     s = re.sub(r"^[^\w]+", "", s).strip()
-    # Strip leading S01E06 if it was at the very start of the filename
     s = re.sub(r"^(?:S\d{1,2}E\d{1,3}|E\d{1,3})\s+", "", s, flags=re.I).strip()
+
+    # Strip "- 5 Seasons", "- 4 Seasons", "- 1 Season" from Series buttons!
+    s = re.sub(r"\b\d{1,2}\s*Seasons?\b.*$", "", s, flags=re.I).strip()
 
     cut_m = re.search(
         r"^(.{2,}?)\s+\b(?:19[5-9]\d|20[0-3]\d|S\d{1,2}E\d{1,3}|S\d{1,2}|Season\s*\d+|E\d{1,3}|EP\.?\s*\d+|"
@@ -221,7 +223,6 @@ def normalize_title_key(title: str) -> str:
 
     s = JUNK_TOKENS_RE.sub("", s)
     out_s = re.sub(r"[^a-zA-Z0-9&]+", " ", s).strip().lower()
-    # Remove trailing standalone junk numbers like "108" unless part of a known sequel
     out_s = re.sub(r"\s+\b(?:108|72|48|36)\b$", "", out_s).strip()
     if out_s in FRANCHISE_ALIASES:
         out_s = FRANCHISE_ALIASES[out_s].lower()
@@ -1893,7 +1894,9 @@ def score_quality_button(text: str) -> int:
 def find_matching_title_buttons_on_page(buttons, query: str, target_year: int = None, visited_keys: set = None):
     visited_keys = visited_keys or set()
     clean_q = normalize_title_key(query)
-    candidates = []
+    exact_candidates = []
+    partial_candidates = []
+
     for r_idx, row in enumerate(buttons):
         for c_idx, btn in enumerate(row):
             txt = (btn.text or "").strip()
@@ -1903,20 +1906,34 @@ def find_matching_title_buttons_on_page(buttons, query: str, target_year: int = 
             btn_key = f"{txt}_{r_idx}_{c_idx}"
             if btn_key in visited_keys or txt in visited_keys or not is_strict_title_and_year_match(txt, query, target_year):
                 continue
-            score = 100
+
             btn_clean = normalize_title_key(txt)
-            if btn_clean == clean_q:
-                score += 500
-            elif btn_clean.startswith(clean_q):
-                score += 300
-            if target_year and str(target_year) in txt:
-                score += 400
+            score = 100
+
             if "📺" in txt or "season" in low:
-                score += 250
+                score += 1200
+                s_cnt = re.search(r"\b(\d{1,2})\s*seasons?\b", low)
+                if s_cnt:
+                    score += int(s_cnt.group(1)) * 50
+
+            if target_year and str(target_year) in txt:
+                score += 500
+
             score += score_quality_button(txt) // 4
-            candidates.append((score, txt, btn))
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    return candidates
+
+            if btn_clean == clean_q:
+                score += 2000
+                exact_candidates.append((score, txt, btn))
+            elif btn_clean.startswith(clean_q):
+                score += 200
+                partial_candidates.append((score, txt, btn))
+
+    if exact_candidates:
+        exact_candidates.sort(key=lambda x: x[0], reverse=True)
+        return exact_candidates
+
+    partial_candidates.sort(key=lambda x: x[0], reverse=True)
+    return partial_candidates
 
 def collect_resolution_quality_buttons(buttons, visited_qualities: set = None):
     visited_qualities = visited_qualities or set()
@@ -2197,6 +2214,40 @@ async def navigate_to_grid(
             return msg, available_seasons, (discovered_resolutions or TARGET_RESOLUTIONS)
 
         if "choose the correct title" in text or "matching results" in text or "search results for" in text or len(msg.buttons) >= 2:
+            if "select the available quality" not in text and "quality" not in text:
+                candidates = find_matching_title_buttons_on_page(msg.buttons, query, target_year, visited_title_btns)
+                if candidates:
+                    _, btn_txt, chosen_btn = candidates[0]
+                    is_series_folder = ("📺" in btn_txt or "season" in btn_txt.lower())
+
+                    # Only mark direct movie buttons as visited; if a Series folder button is slow, retry it instead of jumping to Button #2!
+                    if not is_series_folder:
+                        visited_title_btns.add(btn_txt)
+
+                    btn_res = extract_resolution_tag(btn_txt, "HD")
+                    btn_tier = extract_audio_tier(btn_txt)
+                    v_key = extract_movie_variant_key(btn_txt, btn_res, btn_tier)
+                    if not is_series_folder and btn_res != "HD" and is_already_in_any_channel(query, "MOVIE", v_key, min_audio_tier=btn_tier):
+                        continue
+
+                    FILE_COMPLETED_EVENT.clear()
+                    await smart_click_button(chosen_btn, bot_entity)
+                    updated_msg = await wait_for_menu_update(bot_entity, tracked_menu_id, old_sig, max_wait=5.0)
+                    if not is_series_folder and (not updated_msg or get_menu_signature(updated_msg) == old_sig):
+                        try:
+                            await asyncio.wait_for(FILE_COMPLETED_EVENT.wait(), timeout=45)
+                        except asyncio.TimeoutError:
+                            pass
+                        await asyncio.sleep(2.5)
+                    continue
+                else:
+                    nxt_btn = get_next_page_button(msg)
+                    if nxt_btn and title_page_tries < 6:
+                        title_page_tries += 1
+                        await smart_click_button(nxt_btn, bot_entity)
+                        await wait_for_menu_update(bot_entity, tracked_menu_id, old_sig)
+                        continue
+                    return None, [], []
             if "select the available quality" not in text and "quality" not in text:
                 candidates = find_matching_title_buttons_on_page(msg.buttons, query, target_year, visited_title_btns)
                 if candidates:
