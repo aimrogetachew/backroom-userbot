@@ -978,57 +978,86 @@ async def gemini_interactive_agent(user_msg: str) -> dict:
     history_str = "\n".join(AI_CHAT_HISTORY)
 
     prompt = f"""
-    You are THE BACKROOM AI COMMANDER — a persistent personal AI operating system inside the owner's Telegram account.
+    You are THE BACKROOM AI COMMANDER — a personal AI operating system inside the owner's Telegram account.
     Current State:
     - Active Download: {ACTIVE_CLEAN_TITLE or 'Idle'} ({ACTIVE_RES_TAG or '-'}) | Queue: {len(TITLE_QUEUE)}
     - Auto-Crawler: {'ON' if AUTO_DISCOVERY_ENABLED else 'OFF'} (Year: {c_yr}, Category: {c_kind})
-    - Gemini Keys Pool: {len(GEMINI_KEYS)} | Delivery Bots: {len(BOT_POOL)}
     - Channels (cat_key: channel_id): {json.dumps(ch_map)}
 
-    ACTIVE PERMANENT BEHAVIORAL RULES (MUST OBEY):
+    ACTIVE PERMANENT BEHAVIORAL RULES:
     {rules_str}
 
     RELEVANT LONG-TERM MEMORIES:
     {mem_str}
 
-    RECENT CONVERSATION:
+    RECENT CONVERSATION HISTORY:
     {history_str}
 
     OWNER MESSAGE: "{user_msg}"
 
-    CRITICAL EXECUTION RULES (DO NOT ROLEPLAY WITHOUT AN ACTION!):
-    1. NEVER say "I am checking right now" or "Let me search for X" with action="CHAT_ONLY"! You are a single-turn tool executor: if an action is needed, you MUST set the matching "action" field NOW!
-    2. If the owner sends a movie or series title (e.g. "Prison break", "Vikings", "Solo Leveling") or asks to find/download/pull up a title, you MUST set action="QUEUE_TITLES" and populate "tasks": [{{"raw": "Prison Break", "title": "Prison Break", "year": null, "mode": "normal", "season": null, "episodes": null}}]!
-    3. If the owner asks to check/scan/verify what movies or files are inside their storage channel(s) (or says "Have u checked it?"), you MUST set action="INSPECT_STORAGE" and target_channel_key="<cat_key or null for all>"!
-    4. If the owner says "stop anything on progress" or "stop everything", set action="STOP_ALL" and crawler_on=false.
-    5. If the owner asks to delete everything from one storage channel and re-upload it again by itself, set action="WIPE_AND_REUPLOAD_CHANNEL" and target_channel_key="<cat_key_or_id>".
-    6. If the owner gives a permanent rule ("From now on...", "Always...", "Never..."), set action="MANAGE_RULE", rule_op="ADD", and rule_text="<clean rule>".
-    7. Other actions: "SEARCH_ACCOUNT", "SEARCH_CONTACTS", "INSPECT_WEBSITE", "SELF_EVOLVE", "SCHEDULE_JOB", "DELETE_MEDIA", "REUPLOAD_MEDIA", "RENAME_ALL_PUBLIC", "REBUILD_SERIES_INDEX", "RENAME_CHANNEL", "DELETE_CHANNEL", "CLEAR_CHANNEL_MESSAGES", "CREATE_CHANNEL", "CRAWLER_CONTROL", "SKIP", "CLEAR_QUEUE".
+    STRICT ACTION RULES:
+    1. If the owner asks to fetch/search/download/pull up a movie or series — OR confirms a follow-up like "Yes 1 season only" for a series discussed in RECENT CONVERSATION HISTORY — you MUST set:
+       - "action": "QUEUE_TITLES"
+       - "target_title": "Exact Movie or Series Title (e.g. Game of Thrones)"
+       - "target_season": integer season number if requested (e.g. 1) else null
+       - "tasks": [{{"raw": "Game of Thrones S01", "title": "Game of Thrones", "year": null, "mode": "normal", "season": 1, "episodes": null}}]
+    2. NEVER say "Fetching X", "Pulling up X", "Searching for X", or "Here it comes!" with action="CHAT_ONLY"!
+    3. If the owner asks to check/scan their storage channel, set "action": "INSPECT_STORAGE".
+    4. If the owner says "stop anything on progress" or "stop everything", set "action": "STOP_ALL".
+    5. If the owner gives a permanent rule ("From now on..."), set "action": "MANAGE_RULE", "rule_op": "ADD", "rule_text": "...".
 
     Return ONLY valid JSON:
     {{
       "reply": "Warm, direct HTML-formatted response",
-      "action": "CHAT_ONLY",
+      "action": "CHOOSE_ONE: QUEUE_TITLES | CHAT_ONLY | STOP_ALL | INSPECT_STORAGE | MANAGE_RULE | WIPE_AND_REUPLOAD_CHANNEL | DELETE_MEDIA | REUPLOAD_MEDIA | RENAME_ALL_PUBLIC | REBUILD_SERIES_INDEX | RENAME_CHANNEL | DELETE_CHANNEL | CREATE_CHANNEL | CRAWLER_CONTROL | SKIP | CLEAR_QUEUE",
       "risk_level": "LOW",
+      "target_title": null,
+      "target_season": null,
       "rule_op": null, "rule_id": null, "rule_text": null, "memory_to_save": null,
       "search_query": null, "cap_name": null, "cap_description": null, "cap_code": null,
       "schedule_prompt": null, "interval_minutes": null, "target_channel_key": null,
-      "new_name": null, "target_title": null, "crawler_year": null, "crawler_mode": null,
+      "new_name": null, "crawler_year": null, "crawler_mode": null,
       "crawler_on": null, "tasks": []
     }}
     """
     res = await ask_gemini_json(prompt)
     if isinstance(res, dict) and res.get("action"):
-        # Safety Net: If Gemini's reply says it is searching/pulling up a title but forgot to set action="QUEUE_TITLES"
         act = (res.get("action") or "CHAT_ONLY").upper()
-        rep_low = (res.get("reply") or "").lower()
-        if act == "CHAT_ONLY":
-            if any(p in rep_low for p in ["looking into your storage", "checking it right now", "pull up the list from your storage"]):
-                res["action"] = "INSPECT_STORAGE"
-            elif any(p in rep_low for p in ["let me search for", "pull up the series index", "fetch its details"]) and len(user_msg.split()) <= 6:
-                cmd = parse_smart_user_command(user_msg)
+        rep_txt = res.get("reply") or ""
+        rep_low = rep_txt.lower()
+
+        # 1. If Gemini set target_title at top-level but left tasks empty, build the task automatically!
+        if res.get("target_title") and not res.get("tasks") and act in ("QUEUE_TITLES", "CHAT_ONLY"):
+            t_name = str(res["target_title"]).strip()
+            s_num = int(res["target_season"]) if str(res.get("target_season") or "").isdigit() else None
+            cmd = parse_smart_user_command(t_name)
+            if s_num:
+                cmd["season"] = s_num
+            res["action"] = "QUEUE_TITLES"
+            res["tasks"] = [cmd]
+            return res
+
+        # 2. Promise & Bold-Title Enforcer: If Gemini's reply says "Fetching / Pulling up / Searching for <b>Title</b>"
+        #    while leaving action="CHAT_ONLY", extract the <b>Title</b> from the reply and force QUEUE_TITLES!
+        promise_words = [
+            "fetching", "pulling up", "let me search", "searching for", "downloading",
+            "queueing", "grabbing", "here it comes", "give me a second to pull", "on it right now"
+        ]
+        if act == "CHAT_ONLY" and any(pw in rep_low for pw in promise_words):
+            bold_matches = re.findall(r"<b>([^<]{2,60})</b>", rep_txt)
+            extracted_raw = bold_matches[0] if bold_matches else user_msg
+            cmd = parse_smart_user_command(extracted_raw)
+            # Also check if season number was mentioned in user_msg (e.g. "Yes 1 season only") or reply
+            s_m = re.search(r"\b(?:season\s*|s)0*(\d{1,2})\b|\b(\d{1,2})\s+season\b", f"{user_msg} {extracted_raw}", re.I)
+            if s_m:
+                cmd["season"] = int(s_m.group(1) or s_m.group(2))
+            if cmd.get("title") and normalize_title_key(cmd["title"]) != "unknown":
                 res["action"] = "QUEUE_TITLES"
                 res["tasks"] = [cmd]
+                return res
+
+        if act == "CHAT_ONLY" and any(p in rep_low for p in ["looking into your storage", "checking it right now", "pull up the list from your storage"]):
+            res["action"] = "INSPECT_STORAGE"
         return res
 
     top_tasks = await tmdb_smart_list_fallback(user_msg)
@@ -2780,12 +2809,50 @@ async def execute_ai_controller_action(ai_res: dict, event, raw_user_req: str = 
         conn.close()
         await event.reply(f"⏰ <b>Scheduled Recurring Job:</b> <code>{s_p}</code> (Every <code>{iv}</code> mins)", parse_mode="HTML")
 
+    elif act == "INSPECT_STORAGE":
+        ch_key = (ai_res.get("target_channel_key") or "").strip().lower()
+        ch_map = load_all_channels_from_db()
+        scan_list = [(ch_key, ch_map[ch_key])] if ch_key in ch_map else list(ch_map.items())[:8]
+        lines = ["📂 <b>Live Storage Channel Scan Results:</b>"]
+        for k_name, cid in scan_list:
+            try:
+                sample_files = []
+                async for m in client.iter_messages(cid, limit=8):
+                    if m.video or m.document:
+                        fn = extract_real_filename(m.file.name if m.file else "", m.text or "")
+                        sample_files.append(fn[:45])
+                if sample_files:
+                    lines.append(f"• <b>{k_name.upper()}</b> (<code>{cid}</code>): " + ", ".join(f"<code>{x}</code>" for x in sample_files[:4]))
+            except Exception:
+                pass
+        await event.reply("\n".join(lines) if len(lines) > 1 else "ℹ️ No video files found in the scanned channels.", parse_mode="HTML")
+
     elif act == "QUEUE_TITLES":
         tasks = ai_res.get("tasks") or []
-        for t_obj in tasks:
+        if not tasks and ai_res.get("target_title"):
+            cmd = parse_smart_user_command(str(ai_res["target_title"]))
+            if str(ai_res.get("target_season") or "").isdigit():
+                cmd["season"] = int(ai_res["target_season"])
+            tasks = [cmd]
+
+        added_names = []
+        for t_obj in reversed(tasks):
             if isinstance(t_obj, dict) and t_obj.get("title"):
-                TITLE_QUEUE.append((t_obj, True))
-        if tasks:
+                t_obj["manual"] = True
+                if not t_obj.get("raw"):
+                    t_obj["raw"] = t_obj["title"]
+                if not t_obj.get("mode"):
+                    t_obj["mode"] = "normal"
+                TITLE_QUEUE.appendleft((t_obj, True))
+                s_badge = f" (Season {t_obj['season']:02d})" if t_obj.get("season") else ""
+                added_names.append(f"{t_obj.get('title')}{s_badge}")
+
+        if added_names:
+            await event.reply(f"⏳ <b>Starting Search Now:</b> <code>{', '.join(reversed(added_names))}</code>", parse_mode="HTML")
+            if CURRENT_PIPELINE_ACTIVE:
+                SKIP_CURRENT_TITLE = True
+                FILE_COMPLETED_EVENT.set()
+                await asyncio.sleep(2.2)
             asyncio.create_task(process_queue())
 
     elif act == "DELETE_MEDIA":
